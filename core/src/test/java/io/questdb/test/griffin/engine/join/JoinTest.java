@@ -2841,6 +2841,36 @@ public class JoinTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testJoinInnerPostJoinAndConstFilter() throws Exception {
+        // Regression test for https://github.com/questdb/questdb/issues/6762
+        // When WHERE has both a column-referencing condition (postJoinWhereClause)
+        // and a non-column, non-constant condition (constWhereClause), the code
+        // generator must combine them into a single filter rather than nesting
+        // two FilteredRecordCursorFactory instances (which triggers an assertion).
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (val INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("""
+                    INSERT INTO t VALUES
+                    (1, '2024-01-01T00:00:00.000000Z'),
+                    (2, '2024-01-02T00:00:00.000000Z'),
+                    (3, '2024-01-03T00:00:00.000000Z')
+                    """);
+            assertQueryNoLeakCheck(
+                    """
+                            val\tval1
+                            1\t2
+                            1\t3
+                            2\t3
+                            """,
+                    "SELECT T1.val, T2.val FROM t T1 " +
+                            "INNER JOIN t T2 ON T1.ts < T2.ts " +
+                            "WHERE T1.val > 0 AND NOW() = NOW()",
+                    null, false, false
+            );
+        });
+    }
+
+    @Test
     public void testJoinInnerTimestamp() throws Exception {
         assertMemoryLeak(() -> {
             final String expected = """
