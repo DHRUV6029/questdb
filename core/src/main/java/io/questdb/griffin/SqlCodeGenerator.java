@@ -73,7 +73,6 @@ import io.questdb.griffin.engine.LimitOverflowException;
 import io.questdb.griffin.engine.LimitRecordCursorFactory;
 import io.questdb.griffin.engine.RecordComparator;
 import io.questdb.griffin.engine.functions.GroupByFunction;
-import io.questdb.griffin.engine.functions.bool.AndFunctionFactory;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.griffin.engine.functions.cast.CastByteToCharFunctionFactory;
 import io.questdb.griffin.engine.functions.cast.CastByteToDecimalFunctionFactory;
@@ -5092,26 +5091,7 @@ public class SqlCodeGenerator implements Mutable, Closeable {
                                 SqlHints.hasEnablePreTouchHint(model, masterAlias)
                         );
                     } else {
-                        if (master instanceof FilteredRecordCursorFactory existingFiltered) {
-                            // Combine post-join and const filters into a single AND filter
-                            // to avoid nesting FilteredRecordCursorFactory (which is forbidden
-                            // by its constructor assertion).
-                            Function existingFilter = existingFiltered.getFilter();
-                            RecordCursorFactory base = existingFiltered.getBaseFactory();
-                            existingFiltered.halfClose();
-                            ObjList<Function> andArgs = new ObjList<>(2);
-                            andArgs.add(existingFilter);
-                            andArgs.add(filter);
-                            IntList argPositions = new IntList(2);
-                            argPositions.add(0);
-                            argPositions.add(0);
-                            filter = new AndFunctionFactory().newInstance(
-                                    0, andArgs, argPositions, configuration, executionContext
-                            );
-                            master = new FilteredRecordCursorFactory(base, filter);
-                        } else {
-                            master = new FilteredRecordCursorFactory(master, filter);
-                        }
+                        master = new FilteredRecordCursorFactory(master, filter);
                     }
                 }
             }
