@@ -31,7 +31,10 @@ import io.questdb.FactoryProvider;
 import io.questdb.Metrics;
 import io.questdb.TelemetryConfiguration;
 import io.questdb.VolumeDefinitions;
+import io.questdb.cairo.idx.PostingIndexUtils;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
+import io.questdb.cutlass.qwp.codec.DefaultQwpServerInfoProvider;
+import io.questdb.cutlass.qwp.codec.QwpServerInfoProvider;
 import io.questdb.cutlass.text.TextConfiguration;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.IOURingFacade;
@@ -255,6 +258,8 @@ public interface CairoConfiguration {
     boolean getDefaultSymbolCacheFlag();
 
     int getDefaultSymbolCapacity();
+
+    byte getDefaultSymbolIndexType();
 
     int getDetachedMkDirMode();
 
@@ -492,6 +497,64 @@ public interface CairoConfiguration {
 
     int getPoolSegmentSize();
 
+    default double getPostingIndexAlignedBitWidthThreshold() {
+        return 0.0;
+    }
+
+    /**
+     * Maximum bytes the posting index writer's per-key spill buffers may hold
+     * before it triggers a mid-stream {@code flushAllPending} + free cycle to
+     * bound peak RSS during long indexing runs (ALTER ADD INDEX TYPE POSTING,
+     * IndexBuilder, the per-O3-seal rebuild loop). Returning {@code 0} or a
+     * negative value disables the back-pressure entirely (legacy behaviour:
+     * accumulate until {@code seal()}). Default is 256 MiB.
+     */
+    default long getPostingIndexerSpillBytesMax() {
+        return 256L << 20;
+    }
+
+    default byte getPostingIndexRowIdEncoding() {
+        return PostingIndexUtils.ENCODING_ADAPTIVE;
+    }
+
+    /**
+     * Threshold at which the adaptive posting-index row-id encoder forces
+     * DELTA instead of running the size-only EF-vs-DELTA race. When a key has
+     * {@code >= getPostingIndexAdaptiveDeltaAtOrAbove()} row IDs the writer
+     * skips EF and emits DELTA directly. Default 2000.
+     * <p>
+     * The size-only adaptive pick is essentially a coin-flip at large counts
+     * because both encodings produce similar byte sizes, but DELTA reads
+     * markedly faster (per-block unpack, cache-line-friendly) than EF for
+     * dense keys that span a long high-bits bitmap. For Zipfian-skewed
+     * workloads with hot keys at 100k+ row IDs the threshold lifts point /
+     * scan / range queries by 15-60% with no measurable regression on
+     * uniform-distribution scenarios where keys stay below the threshold.
+     * <p>
+     * Set to {@link Integer#MAX_VALUE} to restore pure size comparison.
+     */
+    default int getPostingIndexAdaptiveDeltaAtOrAbove() {
+        return 2000;
+    }
+
+    int getPostingSealGenThreshold();
+
+    /**
+     * Hard cap on the per-writer in-memory outbox of superseded posting-seal
+     * generations awaiting publish to the global purge queue. When the cap
+     * is reached the writer evicts the oldest entry and emits a critical
+     * log message — the file the entry pointed at is recovered later by the
+     * writer-open orphan scan.
+     * <p>
+     * Sized for steady-state operation where the purge queue is healthy. If
+     * the queue is saturated for an extended period (e.g. background job
+     * disabled) the outbox saturates, oldest entries are dropped, and the
+     * orphan scan picks up the slack on the next reopen.
+     */
+    default int getPostingSealPurgeOutboxMax() {
+        return 8192;
+    }
+
     int getPreferencesStringPoolCapacity();
 
     int getQueryCacheEventQueueCapacity();
@@ -505,8 +568,8 @@ public interface CairoConfiguration {
      * live replication role so clients can route reads to primary vs replica.
      */
     @NotNull
-    default io.questdb.cutlass.qwp.codec.QwpServerInfoProvider getQwpServerInfoProvider() {
-        return io.questdb.cutlass.qwp.codec.DefaultQwpServerInfoProvider.INSTANCE;
+    default QwpServerInfoProvider getQwpServerInfoProvider() {
+        return DefaultQwpServerInfoProvider.INSTANCE;
     }
 
     @NotNull
@@ -542,6 +605,13 @@ public interface CairoConfiguration {
     }
 
     boolean getSampleByDefaultAlignmentCalendar();
+
+    /**
+     * Selects the sort backend the SAMPLE BY FILL fast path stacks above
+     * the GROUP BY output. Returns one of {@link SampleBySortStrategy}'s int
+     * constants. The default is {@link SampleBySortStrategy#LIGHT_ENCODED}.
+     */
+    int getSampleByFillSortStrategy();
 
     int getSampleByIndexSearchPageSize();
 
@@ -857,6 +927,8 @@ public interface CairoConfiguration {
 
     boolean isIOURingEnabled();
 
+    boolean isMatViewCoveringIndexEnabled();
+
     boolean isMatViewEnabled();
 
     boolean isMatViewParallelSqlEnabled();
@@ -878,6 +950,8 @@ public interface CairoConfiguration {
     boolean isPartitionEncoderParquetStatisticsEnabled();
 
     boolean isPartitionO3OverwriteControlEnabled();
+
+    boolean isPostingIndexAutoIncludeTimestamp();
 
     boolean isQueryTracingEnabled();
 

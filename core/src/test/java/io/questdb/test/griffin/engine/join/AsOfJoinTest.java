@@ -43,6 +43,7 @@ import org.junit.Assert;
 import org.junit.Test;
 
 public class AsOfJoinTest extends AbstractCairoTest {
+    private final String defaultIndexTypeName;
     private final TestTimestampType leftTableTimestampType;
     private final TestTimestampType rightTableTimestampType;
 
@@ -50,6 +51,13 @@ public class AsOfJoinTest extends AbstractCairoTest {
         Rnd rnd = TestUtils.generateRandom(LOG);
         this.leftTableTimestampType = TestUtils.getTimestampType(rnd);
         this.rightTableTimestampType = TestUtils.getTimestampType(rnd);
+        this.defaultIndexTypeName = TestUtils.randomSymbolIndexTypeName(rnd);
+    }
+
+    @Override
+    public void setUp() {
+        setProperty(PropertyKey.CAIRO_DEFAULT_SYMBOL_INDEX_TYPE, defaultIndexTypeName);
+        super.setUp();
     }
 
     @Test
@@ -1013,6 +1021,72 @@ public class AsOfJoinTest extends AbstractCairoTest {
                     """, leftSuffix, rightSuffix);
 
             printSqlResult(expected, query, "timebid", false, false);
+        });
+    }
+
+    @Test
+    public void testAsOfJoinNoKeyWithTopDownFilteredDateaddTimestampProjection() throws Exception {
+        assertMemoryLeak(() -> {
+            executeWithRewriteTimestamp("""
+                            CREATE TABLE fx_trades (
+                                timestamp #TIMESTAMP,
+                                trade_id INT,
+                                symbol SYMBOL
+                            ) TIMESTAMP(timestamp) PARTITION BY DAY
+                            """,
+                    leftTableTimestampType.getTypeName()
+            );
+            execute("""
+                    INSERT INTO fx_trades VALUES
+                        ('2026-04-14T00:00:10.000000Z', 1, 'EURUSD'),
+                        ('2026-04-14T00:01:10.000000Z', 2, 'EURUSD')
+                    """);
+
+            executeWithRewriteTimestamp("""
+                            CREATE TABLE market_data (
+                                timestamp #TIMESTAMP,
+                                symbol SYMBOL,
+                                best_bid DOUBLE,
+                                best_ask DOUBLE
+                            ) TIMESTAMP(timestamp) PARTITION BY DAY
+                            """,
+                    rightTableTimestampType.getTypeName()
+            );
+            execute("""
+                    INSERT INTO market_data VALUES
+                        ('2026-04-14T00:00:30.000000Z', 'EURUSD', 1.09, 1.11),
+                        ('2026-04-14T00:01:30.000000Z', 'EURUSD', 1.19, 1.21)
+                    """);
+
+            assertQueryNoLeakCheck(
+                    replaceTimestampSuffix("""
+                                    trade_id\ttimestamp\tbest_bid\tbest_ask
+                                    1\t2026-04-14T00:00:10.000000Z\t1.09\t1.11
+                                    2\t2026-04-14T00:01:10.000000Z\t1.19\t1.21
+                                    """,
+                            leftTableTimestampType.getTypeName()),
+                    """
+                            WITH trades_yday AS (
+                                SELECT timestamp, trade_id, symbol
+                                FROM fx_trades
+                                WHERE symbol = 'EURUSD'
+                                    AND timestamp >= '2026-04-14T00:00:00Z'
+                                    AND timestamp < '2026-04-15T00:00:00Z'
+                                LIMIT 2
+                            ),
+                            market_data_p30 AS (
+                                SELECT dateadd('s', -30, timestamp) AS timestamp, symbol, best_bid, best_ask
+                                FROM market_data
+                                WHERE symbol = 'EURUSD'
+                            )
+                            SELECT t.trade_id, t.timestamp, md.best_bid, md.best_ask
+                            FROM trades_yday t
+                            ASOF JOIN market_data_p30 md
+                            """,
+                    "timestamp",
+                    false,
+                    false
+            );
         });
     }
 

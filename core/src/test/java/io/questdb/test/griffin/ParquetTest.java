@@ -25,11 +25,15 @@
 package io.questdb.test.griffin;
 
 import io.questdb.PropertyKey;
-import io.questdb.cairo.BitmapIndexReader;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.SqlJitMode;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.std.Rnd;
 import io.questdb.std.Unsafe;
+import io.questdb.std.str.Utf8Sequence;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
@@ -893,49 +897,6 @@ public class ParquetTest extends AbstractCairoTest {
         });
     }
 
-    @Test
-    public void testIndexReloadAfterConvertToParquet() throws Exception {
-        assertMemoryLeak(() -> {
-            execute("CREATE TABLE x (id SYMBOL INDEX, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
-            execute(
-                    "INSERT INTO x VALUES" +
-                            "('k1', '2024-06-10T00:00:00.000000Z')," +
-                            "('k2', '2024-06-10T01:00:00.000000Z')," +
-                            "('k1', '2024-06-11T00:00:00.000000Z')," +
-                            "('k3', '2024-06-12T00:00:00.000000Z')," +
-                            "('k1', '2024-06-12T00:00:01.000000Z')"
-            );
-
-            final int idColumnIndex = 0;
-
-            // Open the reader and force bitmap index reader creation on native
-            // partitions by explicitly calling getBitmapIndexReader().
-            try (var reader = engine.getReader("x")) {
-                for (int i = 0; i < reader.getPartitionCount(); i++) {
-                    reader.openPartition(i);
-                    reader.getBitmapIndexReader(i, idColumnIndex, BitmapIndexReader.DIR_BACKWARD);
-                }
-            }
-
-            // Convert non-last partitions to parquet while the pool holds
-            // a reader with pre-existing bitmap index readers.
-            execute("ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10', '2024-06-11'");
-
-            // Re-acquire the pooled reader. goActive() -> reload() detects the
-            // parquet conversion, closes partitions (but closeIndexReader() does
-            // not null bitmapIndexes entries), and later openPartition0() for
-            // parquet calls pathGenNativePartition() on a path already holding
-            // the parquet filename — producing a bogus native path.
-            final String expected = """
-                    id\tts
-                    k1\t2024-06-10T00:00:00.000000Z
-                    k1\t2024-06-11T00:00:00.000000Z
-                    k1\t2024-06-12T00:00:01.000000Z
-                    """;
-            assertSql(expected, "x WHERE id = 'k1'");
-        });
-    }
-
     // TODO(puzpuzpuz): enable when we support DDLs for parquet partitions
     @Ignore
     @Test
@@ -1077,6 +1038,49 @@ public class ParquetTest extends AbstractCairoTest {
 
             execute("alter table x convert partition to native where ts >= 0");
             assertSql(expected, query);
+        });
+    }
+
+    @Test
+    public void testIndexReloadAfterConvertToParquet() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (id SYMBOL INDEX, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute(
+                    "INSERT INTO x VALUES" +
+                            "('k1', '2024-06-10T00:00:00.000000Z')," +
+                            "('k2', '2024-06-10T01:00:00.000000Z')," +
+                            "('k1', '2024-06-11T00:00:00.000000Z')," +
+                            "('k3', '2024-06-12T00:00:00.000000Z')," +
+                            "('k1', '2024-06-12T00:00:01.000000Z')"
+            );
+
+            final int idColumnIndex = 0;
+
+            // Open the reader and force bitmap index reader creation on native
+            // partitions by explicitly calling getBitmapIndexReader().
+            try (var reader = engine.getReader("x")) {
+                for (int i = 0; i < reader.getPartitionCount(); i++) {
+                    reader.openPartition(i);
+                    reader.getIndexReader(i, idColumnIndex, IndexReader.DIR_BACKWARD);
+                }
+            }
+
+            // Convert non-last partitions to parquet while the pool holds
+            // a reader with pre-existing bitmap index readers.
+            execute("ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10', '2024-06-11'");
+
+            // Re-acquire the pooled reader. goActive() -> reload() detects the
+            // parquet conversion, closes partitions (but closeIndexReader() does
+            // not null bitmapIndexes entries), and later openPartition0() for
+            // parquet calls pathGenNativePartition() on a path already holding
+            // the parquet filename — producing a bogus native path.
+            final String expected = """
+                    id\tts
+                    k1\t2024-06-10T00:00:00.000000Z
+                    k1\t2024-06-11T00:00:00.000000Z
+                    k1\t2024-06-12T00:00:01.000000Z
+                    """;
+            assertSql(expected, "x WHERE id = 'k1'");
         });
     }
 
@@ -1351,63 +1355,6 @@ public class ParquetTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testWalAlterColumnTypeWithParquetPartition() throws Exception {
-        // Regression test: ALTER TABLE ALTER COLUMN TYPE on a WAL table with
-        // parquet partitions.
-        //
-        // The WAL sequencer accepts the schema change, but when ApplyWal2TableJob
-        // applies it to the table writer, ConvertOperatorImpl tries to open
-        // native column files (.d) for the parquet partition — which don't exist.
-        // This makes the table writer DISTRESSED and the table SUSPENDED.
-        // Subsequent WAL transactions (inserts, O3) are silently lost.
-        //
-        // The table must either:
-        //   (a) convert parquet partitions back to native before the type change, or
-        //   (b) reject the ALTER with a clear error if parquet partitions exist.
-        assertMemoryLeak(() -> {
-            execute("""
-                    CREATE TABLE x (
-                        val DOUBLE,
-                        sym SYMBOL,
-                        ts TIMESTAMP
-                    ) TIMESTAMP(ts) PARTITION BY DAY WAL
-                    """);
-            execute("""
-                    INSERT INTO x VALUES
-                    (1.0, 'A', '2024-01-01T00:00:00.000000Z'),
-                    (2.0, 'B', '2024-01-01T12:00:00.000000Z'),
-                    (3.0, 'C', '2024-01-02T00:00:00.000000Z')
-                    """);
-            drainWalQueue();
-
-            execute("ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
-            drainWalQueue();
-
-            // ALTER COLUMN TYPE through WAL — the column conversion must NOT
-            // leave the table suspended.
-            execute("ALTER TABLE x ALTER COLUMN val TYPE SYMBOL");
-            drainWalQueue();
-
-            // O3 insert into the parquet partition after the type change.
-            execute("INSERT INTO x VALUES ('new_val', 'D', '2024-01-01T06:00:00.000000Z')");
-            drainWalQueue();
-
-            // The O3 insert must not be silently lost. The old DOUBLE values
-            // are converted to SYMBOL strings during the type change (the fix
-            // converts parquet back to native first, so the data is preserved).
-            assertSql("""
-                            val\tsym\tts
-                            1.0\tA\t2024-01-01T00:00:00.000000Z
-                            new_val\tD\t2024-01-01T06:00:00.000000Z
-                            2.0\tB\t2024-01-01T12:00:00.000000Z
-                            3.0\tC\t2024-01-02T00:00:00.000000Z
-                            """,
-                    "SELECT * FROM x"
-            );
-        });
-    }
-
-    @Test
     public void testOrderBy1() throws Exception {
         assertMemoryLeak(() -> {
             execute(
@@ -1674,6 +1621,188 @@ public class ParquetTest extends AbstractCairoTest {
     @Test
     public void testTimeFilterSingleRowGroupPerPartition() throws Exception {
         testTimeFilter(100);
+    }
+
+    @Test
+    public void testVarcharAsciiFlagAfterRewriteWithNonAsciiAppend() throws Exception {
+        // Regression test: VARCHAR column-level ascii flag must not stay stale
+        // across a parquet rewrite that adds non-ASCII bytes.
+        //
+        // When the partition is converted to parquet while the column is
+        // all-ASCII, to_parquet_schema records ascii=Some(true) in the
+        // parquet file's QDB metadata. A later O3 insert with non-ASCII data
+        // triggers processParquetPartition, which goes through
+        // ParquetUpdater::end. Without the fix, end() reuses the old
+        // qdb_meta and preserves the stale ascii=Some(true). The new parquet
+        // file then claims the column is ASCII, and on read every aux header
+        // gets HEADER_FLAG_ASCII set, so isAscii() returns true for bytes
+        // that are not ASCII. TestUtils.println calls assertAsciiCompliance
+        // per VARCHAR row, so the assertSql below fails on the non-ASCII row
+        // without the fix.
+        assertMemoryLeak(() -> {
+            execute("create table x (s varchar, ts timestamp) timestamp(ts) partition by day wal;");
+            execute("insert into x values ('hello', '2020-01-01T00:00:00.000Z');");
+            execute("insert into x values ('world', '2020-01-01T12:00:00.000Z');");
+            drainWalQueue();
+
+            execute("alter table x convert partition to parquet list '2020-01-01';");
+            drainWalQueue();
+
+            // Backdated insert forces an O3 rewrite through ParquetUpdater::end.
+            // 'héllo' has a non-ASCII codepoint (e-acute, U+00E9).
+            execute("insert into x values ('héllo', '2020-01-01T06:00:00.000Z');");
+            drainWalQueue();
+
+            assertSql(
+                    "s\tts\n" +
+                            "hello\t2020-01-01T00:00:00.000000Z\n" +
+                            "héllo\t2020-01-01T06:00:00.000000Z\n" +
+                            "world\t2020-01-01T12:00:00.000000Z\n",
+                    "x order by ts"
+            );
+        });
+    }
+
+    @Test
+    public void testVarcharAsciiFlagOnAddColumnDowngrade() throws Exception {
+        // ADD COLUMN seeds the new VARCHAR column as `true` in the all-ASCII
+        // tracker (existing rows backfill with nulls, which is_column_ascii
+        // skips). track_new_data_ascii must still observe a non-ASCII byte
+        // in a later write and flip the tracker to `false`, so end() emits
+        // Some(false) and the read path does not falsely claim ASCII-ness.
+        // assertSql -> assertAsciiCompliance per VARCHAR row fails if the
+        // column-level flag wrongly forces isAscii() = true on non-ASCII bytes.
+        assertMemoryLeak(() -> {
+            execute("create table x (s varchar, ts timestamp) timestamp(ts) partition by day wal;");
+            execute("insert into x values ('hello', '2020-01-01T00:00:00.000Z');");
+            drainWalQueue();
+
+            execute("alter table x convert partition to parquet list '2020-01-01';");
+            drainWalQueue();
+
+            execute("alter table x add column s2 varchar;");
+            drainWalQueue();
+
+            // Backdated insert with non-ASCII in the new column forces an
+            // O3 rewrite through ParquetUpdater::end and must downgrade
+            // the seeded `true` to `false`. 'héllo' has U+00E9.
+            execute("insert into x (s, ts, s2) values ('aa', '2020-01-01T06:00:00.000Z', 'héllo');");
+            drainWalQueue();
+
+            assertSql(
+                    "s\tts\ts2\n" +
+                            "hello\t2020-01-01T00:00:00.000000Z\t\n" +
+                            "aa\t2020-01-01T06:00:00.000000Z\théllo\n",
+                    "x order by ts"
+            );
+        });
+    }
+
+    @Test
+    public void testVarcharAsciiFlagOnAddColumnFastPath() throws Exception {
+        // ADD COLUMN VARCHAR with only ASCII data written into the new
+        // column must keep the column-level ascii flag set to `true` so
+        // the read fast path stays active. Existing rows backfill with
+        // nulls (skipped by is_column_ascii), so the seed in
+        // ParquetUpdater::set_target_schema starts the tracker at `true`
+        // and no scan flips it. end() emits Some(true), and the parquet
+        // reader sets HEADER_FLAG_ASCII on every non-null aux header.
+        //
+        // Without the seed, the new column has no tracker entry, end()
+        // falls back to Some(false) via unwrap_or(false), and isAscii()
+        // returns false on every value.
+        assertMemoryLeak(() -> {
+            execute("create table x (s varchar, ts timestamp) timestamp(ts) partition by day wal;");
+            execute("insert into x values ('hello', '2020-01-01T00:00:00.000Z');");
+            drainWalQueue();
+
+            execute("alter table x convert partition to parquet list '2020-01-01';");
+            drainWalQueue();
+
+            execute("alter table x add column s2 varchar;");
+            drainWalQueue();
+
+            // Backdated inserts route through ParquetUpdater::end. All s2
+            // values are ASCII so the column-level flag should stay true.
+            execute("insert into x (s, ts, s2) values ('aa', '2020-01-01T03:00:00.000Z', 'first');");
+            execute("insert into x (s, ts, s2) values ('bb', '2020-01-01T06:00:00.000Z', 'second');");
+            drainWalQueue();
+
+            try (RecordCursorFactory factory = select("select s2 from x where s2 is not null order by ts")) {
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    Record record = cursor.getRecord();
+                    int nonNullCount = 0;
+                    while (cursor.hasNext()) {
+                        Utf8Sequence v = record.getVarcharA(0);
+                        Assert.assertNotNull(v);
+                        Assert.assertTrue(
+                                "expected isAscii() = true on ASCII value '" + v
+                                        + "'; ADD COLUMN VARCHAR lost the column-level ascii fast path",
+                                v.isAscii()
+                        );
+                        nonNullCount++;
+                    }
+                    Assert.assertEquals(2, nonNullCount);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testWalAlterColumnTypeWithParquetPartition() throws Exception {
+        // Regression test: ALTER TABLE ALTER COLUMN TYPE on a WAL table with
+        // parquet partitions.
+        //
+        // The WAL sequencer accepts the schema change, but when ApplyWal2TableJob
+        // applies it to the table writer, ConvertOperatorImpl tries to open
+        // native column files (.d) for the parquet partition — which don't exist.
+        // This makes the table writer DISTRESSED and the table SUSPENDED.
+        // Subsequent WAL transactions (inserts, O3) are silently lost.
+        //
+        // The table must either:
+        //   (a) convert parquet partitions back to native before the type change, or
+        //   (b) reject the ALTER with a clear error if parquet partitions exist.
+        assertMemoryLeak(() -> {
+            execute("""
+                    CREATE TABLE x (
+                        val DOUBLE,
+                        sym SYMBOL,
+                        ts TIMESTAMP
+                    ) TIMESTAMP(ts) PARTITION BY DAY WAL
+                    """);
+            execute("""
+                    INSERT INTO x VALUES
+                    (1.0, 'A', '2024-01-01T00:00:00.000000Z'),
+                    (2.0, 'B', '2024-01-01T12:00:00.000000Z'),
+                    (3.0, 'C', '2024-01-02T00:00:00.000000Z')
+                    """);
+            drainWalQueue();
+
+            execute("ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            drainWalQueue();
+
+            // ALTER COLUMN TYPE through WAL — the column conversion must NOT
+            // leave the table suspended.
+            execute("ALTER TABLE x ALTER COLUMN val TYPE SYMBOL");
+            drainWalQueue();
+
+            // O3 insert into the parquet partition after the type change.
+            execute("INSERT INTO x VALUES ('new_val', 'D', '2024-01-01T06:00:00.000000Z')");
+            drainWalQueue();
+
+            // The O3 insert must not be silently lost. The old DOUBLE values
+            // are converted to SYMBOL strings during the type change (the fix
+            // converts parquet back to native first, so the data is preserved).
+            assertSql("""
+                            val\tsym\tts
+                            1.0\tA\t2024-01-01T00:00:00.000000Z
+                            new_val\tD\t2024-01-01T06:00:00.000000Z
+                            2.0\tB\t2024-01-01T12:00:00.000000Z
+                            3.0\tC\t2024-01-02T00:00:00.000000Z
+                            """,
+                    "SELECT * FROM x"
+            );
+        });
     }
 
     private void testArrayColTops(boolean rawArrayEncoding) throws Exception {

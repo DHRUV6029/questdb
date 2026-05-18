@@ -522,6 +522,7 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "cairo.default.sequencer.part.txn.count\tQDB_CAIRO_DEFAULT_SEQUENCER_PART_TXN_COUNT\t0\tdefault\tfalse\tfalse\n" +
                                     "cairo.default.symbol.cache.flag\tQDB_CAIRO_DEFAULT_SYMBOL_CACHE_FLAG\ttrue\tdefault\tfalse\tfalse\n" +
                                     "cairo.default.symbol.capacity\tQDB_CAIRO_DEFAULT_SYMBOL_CAPACITY\t256\tdefault\tfalse\tfalse\n" +
+                                    "cairo.default.symbol.index.type\tQDB_CAIRO_DEFAULT_SYMBOL_INDEX_TYPE\tBITMAP\tdefault\tfalse\tfalse\n" +
                                     "cairo.detached.mkdir.mode\tQDB_CAIRO_DETACHED_MKDIR_MODE\t509\tdefault\tfalse\tfalse\n" +
                                     "dev.mode.enabled\tQDB_DEV_MODE_ENABLED\tfalse\tdefault\tfalse\tfalse\n" +
                                     "cairo.expression.pool.capacity\tQDB_CAIRO_EXPRESSION_POOL_CAPACITY\t8192\tdefault\tfalse\tfalse\n" +
@@ -564,6 +565,12 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "cairo.page.frame.shard.count\tQDB_CAIRO_PAGE_FRAME_SHARD_COUNT\t2\tdefault\tfalse\tfalse\n" +
                                     "cairo.parallel.index.threshold\tQDB_CAIRO_PARALLEL_INDEX_THRESHOLD\t100000\tdefault\tfalse\tfalse\n" +
                                     "cairo.parallel.indexing.enabled\tQDB_CAIRO_PARALLEL_INDEXING_ENABLED\ttrue\tdefault\tfalse\tfalse\n" +
+                                    "cairo.posting.index.auto.include.timestamp\tQDB_CAIRO_POSTING_INDEX_AUTO_INCLUDE_TIMESTAMP\ttrue\tdefault\tfalse\tfalse\n" +
+                                    "cairo.posting.index.indexer.spill.bytes.max\tQDB_CAIRO_POSTING_INDEX_INDEXER_SPILL_BYTES_MAX\t268435456\tdefault\tfalse\tfalse\n" +
+                                    "cairo.posting.index.row.id.encoding\tQDB_CAIRO_POSTING_INDEX_ROW_ID_ENCODING\tadaptive\tdefault\tfalse\tfalse\n" +
+                                    "cairo.posting.index.adaptive.delta.at.or.above\tQDB_CAIRO_POSTING_INDEX_ADAPTIVE_DELTA_AT_OR_ABOVE\t2000\tdefault\tfalse\tfalse\n" +
+                                    "cairo.posting.seal.gen.threshold\tQDB_CAIRO_POSTING_SEAL_GEN_THRESHOLD\t16\tdefault\tfalse\tfalse\n" +
+                                    "cairo.posting.seal.purge.outbox.max\tQDB_CAIRO_POSTING_SEAL_PURGE_OUTBOX_MAX\t8192\tdefault\tfalse\tfalse\n" +
                                     "cairo.query.cache.event.queue.capacity\tQDB_CAIRO_QUERY_CACHE_EVENT_QUEUE_CAPACITY\t4\tdefault\tfalse\tfalse\n" +
                                     "cairo.reader.pool.max.segments\tQDB_CAIRO_READER_POOL_MAX_SEGMENTS\t10\tdefault\tfalse\tfalse\n" +
                                     "cairo.recent.write.tracker.capacity\tQDB_CAIRO_RECENT_WRITE_TRACKER_CAPACITY\t1000\tdefault\tfalse\tfalse\n" +
@@ -667,6 +674,7 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "cairo.sql.compile.view.model.pool.capacity\tQDB_CAIRO_SQL_COMPILE_VIEW_MODEL_POOL_CAPACITY\t8\tdefault\tfalse\tfalse\n" +
                                     "cairo.sql.sampleby.page.size\tQDB_CAIRO_SQL_SAMPLEBY_PAGE_SIZE\t0\tdefault\tfalse\tfalse\n" +
                                     "cairo.sql.sampleby.default.alignment.calendar\tQDB_CAIRO_SQL_SAMPLEBY_DEFAULT_ALIGNMENT_CALENDAR\ttrue\tdefault\tfalse\tfalse\n" +
+                                    "cairo.sql.sampleby.fill.sort.strategy\tQDB_CAIRO_SQL_SAMPLEBY_FILL_SORT_STRATEGY\tlight_encoded\tdefault\tfalse\tfalse\n" +
                                     "cairo.sql.unsupported.sampleby.validate.fill.type\tQDB_CAIRO_SQL_UNSUPPORTED_SAMPLEBY_VALIDATE_FILL_TYPE\ttrue\tdefault\tfalse\tfalse\n" +
                                     "cairo.sql.small.map.key.capacity\tQDB_CAIRO_SQL_SMALL_MAP_KEY_CAPACITY\t32\tdefault\tfalse\tfalse\n" +
                                     "cairo.sql.small.map.page.size\tQDB_CAIRO_SQL_SMALL_MAP_PAGE_SIZE\t32768\tdefault\tfalse\tfalse\n" +
@@ -899,6 +907,7 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "metrics.enabled\tQDB_METRICS_ENABLED\tfalse\tconf\tfalse\tfalse\n" +
                                     "cairo.metadata.cache.snapshot.ordered\tQDB_CAIRO_METADATA_CACHE_SNAPSHOT_ORDERED\ttrue\tdefault\tfalse\tfalse\n" +
                                     "cairo.mat.view.enabled\tQDB_CAIRO_MAT_VIEW_ENABLED\ttrue\tdefault\tfalse\tfalse\n" +
+                                    "cairo.mat.view.covering.index.enabled\tQDB_CAIRO_MAT_VIEW_COVERING_INDEX_ENABLED\tfalse\tdefault\tfalse\tfalse\n" +
                                     "cairo.mat.view.max.refresh.retries\tQDB_CAIRO_MAT_VIEW_MAX_REFRESH_RETRIES\t10\tdefault\tfalse\ttrue\n" +
                                     "cairo.mat.view.refresh.oom.retry.timeout\tQDB_CAIRO_MAT_VIEW_REFRESH_OOM_RETRY_TIMEOUT\t200\tdefault\tfalse\tfalse\n" +
                                     "cairo.mat.view.insert.as.select.batch.size\tQDB_CAIRO_MAT_VIEW_INSERT_AS_SELECT_BATCH_SIZE\t1000000\tdefault\tfalse\ttrue\n" +
