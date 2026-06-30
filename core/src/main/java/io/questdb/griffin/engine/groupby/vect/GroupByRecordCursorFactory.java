@@ -50,6 +50,7 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.PerWorkerLocks;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
+import io.questdb.mp.MCSequence;
 import io.questdb.mp.MPSequence;
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.SOUnboundedCountDownLatch;
@@ -58,10 +59,12 @@ import io.questdb.std.DirectLongLongSortedList;
 import io.questdb.std.IntList;
 import io.questdb.std.Long256;
 import io.questdb.std.Long256Impl;
+import io.questdb.std.MemoryTracker;
 import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 import io.questdb.std.ObjectPool;
+import io.questdb.std.Os;
 import io.questdb.std.Rosti;
 import io.questdb.std.RostiAllocFacade;
 import io.questdb.std.Transient;
@@ -193,8 +196,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
 
             this.frameMemoryPools = new ObjList<>(workerCount);
             for (int i = 0; i < workerCount; i++) {
-                // We're using page frame memory only and do single scan, hence cache size of 1.
-                frameMemoryPools.add(new PageFrameMemoryPool(1));
+                // Single sequential scan; no LRU caching needed across frames.
+                frameMemoryPools.add(new PageFrameMemoryPool(0L));
             }
         } catch (Throwable th) {
             close();
@@ -223,7 +226,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 base.getMetadata(),
                 pageFrameCursor,
                 executionContext.getMessageBus(),
-                executionContext.getCircuitBreaker()
+                executionContext.getCircuitBreaker(),
+                executionContext.getMemoryTracker()
         );
     }
 
@@ -288,6 +292,58 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         for (int i = start; i < end; i++) {
             columnSkewIndex.add(Unsafe.getInt(columnOffsets + vafList.getQuick(i).getValueOffset() * 4L));
         }
+    }
+
+    private static int runWhatsLeft(
+            MCSequence subSeq,
+            RingQueue<VectorAggregateTask> queue,
+            int queuedCount,
+            int reclaimed,
+            int mergedCount,
+            int workerId,
+            SOUnboundedCountDownLatch doneLatch,
+            SqlExecutionCircuitBreaker circuitBreaker,
+            AtomicBooleanCircuitBreaker sharedCB,
+            WorkStealingStrategy workStealingStrategy
+    ) {
+        Throwable firstError = null;
+        while (!doneLatch.done(queuedCount)) {
+            if (circuitBreaker.checkIfTripped()) {
+                sharedCB.cancel();
+            }
+
+            if (workStealingStrategy.shouldSteal(mergedCount)) {
+                long cursor = subSeq.next();
+                if (cursor > -1) {
+                    VectorAggregateTask task = queue.get(cursor);
+                    // Keep draining even if an entry throws (e.g. OOM in a parquet decode): a
+                    // survivor left in the shared queue references frame memory pools buildRosti
+                    // frees on exit, so a later query would steal it and hit the freed pool.
+                    // Surface the first error only once the queue is fully drained.
+                    try {
+                        task.entry.run(workerId, subSeq, cursor);
+                    } catch (Throwable th) {
+                        if (firstError == null) {
+                            firstError = th;
+                        }
+                    }
+                    reclaimed++;
+                } else {
+                    Os.pause();
+                }
+            }
+            mergedCount = doneLatch.getCount();
+        }
+        if (firstError != null) {
+            if (firstError instanceof RuntimeException re) {
+                throw re;
+            }
+            if (firstError instanceof Error err) {
+                throw err;
+            }
+            throw CairoException.nonCritical().put("vectorized aggregation failed [error=").put(firstError.getMessage()).put(']');
+        }
+        return reclaimed;
     }
 
     private void resetRostiMemorySize() {
@@ -419,15 +475,25 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 RecordMetadata metadata,
                 PageFrameCursor frameCursor,
                 MessageBus bus,
-                SqlExecutionCircuitBreaker circuitBreaker
+                SqlExecutionCircuitBreaker circuitBreaker,
+                MemoryTracker memoryTracker
         ) {
             this.frameCursor = frameCursor;
             this.bus = bus;
             this.circuitBreaker = circuitBreaker;
             frameAddressCache.of(metadata, frameCursor.getColumnMapping(), frameCursor.isExternal());
             for (int i = 0; i < workerCount; i++) {
-                frameMemoryPools.getQuick(i).of(frameAddressCache);
+                final PageFrameMemoryPool pool = frameMemoryPools.getQuick(i);
+                pool.setMemoryTracker(memoryTracker);
+                pool.of(frameAddressCache);
             }
+            // Note: only the per-worker page-frame pools are bound to the per-query tracker. The
+            // Rosti hash tables (pRosti), which hold this operator's dominant, cardinality-scaled
+            // allocation, are deliberately left on the global RSS counter: Rosti grows inside
+            // native C with its own OOM path, so it cannot throw at the offending allocation site
+            // the way the wired allocators do. A runaway keyed vectorized GROUP BY is therefore
+            // backstopped by the global RSS limit, not the per-query limit. Wiring Rosti is a
+            // follow-up (see the PR tradeoffs), consistent with how COPY TO is deferred.
             frameCount = 0;
             isRostiBuilt = false;
             return this;
@@ -458,6 +524,10 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         private void buildRosti() {
+            // Consult the breaker before dispatching frames, so an empty base scan still observes cancellation.
+            // Time-throttled so it checks cancellation/timeout unconditionally while bounding the
+            // connection probe to once per window.
+            circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
             final int vafCount = vafList.size();
             final RingQueue<VectorAggregateTask> queue = bus.getVectorAggregateQueue();
             final MPSequence pubSeq = bus.getVectorAggregatePubSeq();
@@ -561,7 +631,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 // Make sure we're consuming jobs even when we failed. We cannot close "rosti" when there are
                 // tasks in flight.
 
-                reclaimed = GroupByNotKeyedVectorRecordCursorFactory.runWhatsLeft(
+                reclaimed = runWhatsLeft(
                         bus.getVectorAggregateSubSeq(),
                         queue,
                         queuedCount,
@@ -647,12 +717,15 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 } else {
                     circuitBreaker.statefulThrowExceptionIfTrippedNoThrottle();
                     for (int j = 0; j < vafCount; j++) {
+                        // some wrapUp() methods can increase rosti size (e.g. inserting the null key)
+                        long oldSize = Rosti.getAllocMemory(pRostiBig);
                         if (!vafList.getQuick(j).wrapUp(pRostiBig)) {
                             resetRostiMemorySize();
                             throw CairoException.nonCritical()
                                     .put("could not wrap up rosti hash table")
                                     .setOutOfMemory(true);
                         }
+                        raf.updateMemoryUsage(pRostiBig, oldSize);
                     }
                 }
             } catch (Throwable t) {

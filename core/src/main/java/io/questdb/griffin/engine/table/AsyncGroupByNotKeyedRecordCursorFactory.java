@@ -48,6 +48,8 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.columns.ColumnFunction;
+import io.questdb.griffin.engine.functions.groupby.MaxTimestampGroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MinTimestampGroupByFunction;
 import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
 import io.questdb.griffin.engine.groupby.GroupByRecordCursorFactory;
 import io.questdb.griffin.engine.groupby.SimpleMapValue;
@@ -115,6 +117,27 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
                 }
             }
 
+            // Mark min/max over the designated timestamp column as designated so they
+            // skip the per-frame column scan. Per-frame data is sorted ASC by the
+            // designated timestamp, so the first row is the frame minimum and the last
+            // row is the frame maximum.
+            final int designatedTsIndex = baseMetadata.getTimestampIndex();
+            if (designatedTsIndex >= 0) {
+                for (int i = 0, n = groupByFunctions.size(); i < n; i++) {
+                    if (batchColumnIndexes[i] != designatedTsIndex) {
+                        continue;
+                    }
+                    if (!markDesignatedTimestamp(groupByFunctions.getQuick(i))) {
+                        continue;
+                    }
+                    if (perWorkerGroupByFunctions != null) {
+                        for (int w = 0, wn = perWorkerGroupByFunctions.size(); w < wn; w++) {
+                            markDesignatedTimestamp(perWorkerGroupByFunctions.getQuick(w).getQuick(i));
+                        }
+                    }
+                }
+            }
+
             AsyncGroupByNotKeyedAtom atom = new AsyncGroupByNotKeyedAtom(
                     asm,
                     configuration,
@@ -166,8 +189,15 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
         final int order = base.getScanDirection() == SCAN_DIRECTION_BACKWARD ? ORDER_DESC : ORDER_ASC;
         frameSequence.of(base, executionContext, order);
-        cursor.of(frameSequence, executionContext);
-        return cursor;
+        try {
+            cursor.of(frameSequence, executionContext);
+            return cursor;
+        } catch (Throwable th) {
+            // On a mid-reopen breach, close() drains the partially reopened atom and resets isOpen
+            // so the cached factory stays reusable.
+            cursor.close();
+            throw th;
+        }
     }
 
     @Override
@@ -467,6 +497,18 @@ public class AsyncGroupByNotKeyedRecordCursorFactory extends AbstractRecordCurso
             frameMemoryPool.releaseParquetBuffers();
             atom.release(slotId);
         }
+    }
+
+    private static boolean markDesignatedTimestamp(GroupByFunction f) {
+        if (f instanceof MinTimestampGroupByFunction mf) {
+            mf.setDesignated(true);
+            return true;
+        }
+        if (f instanceof MaxTimestampGroupByFunction mf) {
+            mf.setDesignated(true);
+            return true;
+        }
+        return false;
     }
 
     /**

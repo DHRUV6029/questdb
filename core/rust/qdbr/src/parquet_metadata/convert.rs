@@ -34,6 +34,7 @@ use crate::parquet_metadata::types::{
 };
 use crate::parquet_metadata::writer::ParquetMetaWriter;
 use parquet2::metadata::FileMetaData;
+use parquet2::metadata::SortingColumn;
 use parquet2::schema::types::{PhysicalType, PrimitiveLogicalType};
 use qdb_core::col_type::ColumnTypeTag;
 
@@ -69,10 +70,17 @@ pub type TsStatsBackfill<'a> = dyn Fn(usize, usize, usize) -> ParquetResult<i64>
 ///   timestamp column lacks inline min/max stats. When provided, the converter
 ///   invokes it with `(rg_idx, 0, 1)` for min and `(rg_idx, num_values - 1,
 ///   num_values)` for max, then writes the results as inline stats.
+/// - `parquet_file_data` - Optional view of the parquet file's bytes (mmap or
+///   buffer). When provided, any column chunk whose parquet footer carries a
+///   `bloom_filter_offset` has its bitset read from this slice and inlined
+///   into the `_pm` out-of-line region. When `None`, bloom filters are not
+///   inlined and readers fall back to reading the bitset from the parquet
+///   file at query time.
 ///
 /// # Errors
 /// - If any column chunk references an external `file_path` (not supported).
-/// - If sorting columns differ between row groups.
+/// - If the footer's row groups declare conflicting sorting columns and
+///   `qdb_meta` has no designated timestamp to fall back on.
 /// - If `qdb_meta` is present but its schema length doesn't match the parquet column count.
 pub fn convert_from_parquet(
     file_metadata: &FileMetaData,
@@ -80,6 +88,7 @@ pub fn convert_from_parquet(
     parquet_footer_offset: u64,
     parquet_footer_length: u32,
     ts_stats_backfill: Option<&TsStatsBackfill<'_>>,
+    parquet_file_data: Option<&[u8]>,
 ) -> ParquetResult<(Vec<u8>, u64)> {
     let columns = file_metadata.schema_descr.columns();
     let col_count = columns.len();
@@ -96,9 +105,8 @@ pub fn convert_from_parquet(
         }
     }
 
-    // Validate no file_path references and extract/validate sorting columns.
     validate_file_paths(file_metadata)?;
-    let sorting_cols = extract_sorting_columns(file_metadata)?;
+    let sorting_cols = resolve_sorting_columns(file_metadata, qdb_meta)?;
 
     // Detect designated timestamp.
     let designated_ts = detect_designated_timestamp(file_metadata, qdb_meta, &sorting_cols);
@@ -252,6 +260,33 @@ pub fn convert_from_parquet(
             }
             if let Some(ref max_bytes) = chunk.ool_max {
                 rg_builder.add_out_of_line_stat(col_idx, false, max_bytes)?;
+            }
+
+            // Inline the bloom-filter bitset into `_pm` when the caller gave
+            // us a view of the parquet file. The migration and snapshot
+            // restore paths must pass `parquet_file_data` so that the
+            // resulting `_pm` matches what the write path produces; without
+            // this, readers fall back to reading the bitset from the parquet
+            // file on every query.
+            if let (Some((offset, _len)), Some(file_data)) =
+                (chunk.bloom_filter_parquet, parquet_file_data)
+            {
+                // A bloom filter the footer claims must be readable. If the bitset cannot be
+                // read (corruption, or a bloom-filter header parquet2 does not support), abort
+                // the conversion rather than silently producing a _pm without it -- the caller
+                // (Mig941, snapshot restore, attach) surfaces the failure with the table path.
+                let bitset = parquet2::bloom_filter::read_from_slice_at_offset(offset, file_data)
+                    .map_err(|err| {
+                    parquet_meta_err!(
+                        ParquetMetaErrorKind::Conversion,
+                        "could not read parquet bloom filter at offset {}: {}",
+                        offset,
+                        err
+                    )
+                })?;
+                if !bitset.is_empty() {
+                    rg_builder.add_bloom_filter(col_idx, bitset)?;
+                }
             }
         }
 
@@ -518,45 +553,55 @@ pub fn generate_parquet_metadata(
 
 /// Updates an existing `_pm` file incrementally (append-only).
 ///
-/// Compares the new parquet row groups against the existing `_pm` to determine
-/// which row groups are unchanged, changed, or new. Unchanged row groups keep
-/// their original offsets (no data rewritten). Only new/changed blocks and a
-/// new footer are appended after the existing trailer, leaving the previous
-/// bytes intact so that any older committed `parquetMetaFileSize` continues
-/// to resolve to a consistent older snapshot.
+/// Compares the new parquet row groups against the committed `_pm`: unchanged
+/// row groups keep their original offsets (no data rewritten); only new/changed
+/// blocks and a new footer are appended at `append_base`, leaving the committed
+/// bytes -- and any orphaned dead-footer tail in [parse anchor, append_base) --
+/// intact, so any older committed `parquetMetaFileSize` still resolves to a
+/// consistent snapshot.
 ///
-/// Returns the bytes the caller must append at `existing_parquet_meta_file_size` and
-/// the resulting file size. Returns an error when the new row group count is
-/// smaller than the existing one (compaction is not supported in the in-place
-/// path; the writer's row-group entry list cannot drop existing references).
+/// `existing_parquet_meta_file_size` is the committed parse anchor (drives which
+/// footer is parsed, the new footer's `prev`, and the reused offsets);
+/// `append_base` (the published header, `>=` the parse anchor) is where the new
+/// bytes land. `existing_parquet_meta` must span at least `append_base` bytes.
+///
+/// Returns the bytes to append at `append_base` and the resulting file size.
+/// Errors when the new row group count is smaller than the existing one
+/// (compaction is not supported in the in-place path).
 #[allow(clippy::too_many_arguments)]
 pub fn update_parquet_metadata(
     existing_parquet_meta: &[u8],
     existing_parquet_meta_file_size: u64,
+    append_base: u64,
     thrift_row_groups: &[parquet2::thrift_format::RowGroup],
     parquet_footer_offset: u64,
     parquet_footer_length: u32,
     bloom_bitsets: &[Vec<Option<Vec<u8>>>],
     unused_bytes: u64,
 ) -> ParquetResult<ParquetMetaUpdateResult> {
-    let existing_parquet_meta_len =
-        usize::try_from(existing_parquet_meta_file_size).map_err(|_| {
-            parquet_meta_err!(
-                ParquetMetaErrorKind::Truncated,
-                "_pm file size {} exceeds addressable range",
-                existing_parquet_meta_file_size
-            )
-        })?;
-    let existing_parquet_meta = existing_parquet_meta
-        .get(..existing_parquet_meta_len)
-        .ok_or_else(|| {
-            parquet_meta_err!(
-                ParquetMetaErrorKind::Truncated,
-                "_pm file size {} exceeds available data {}",
-                existing_parquet_meta_file_size,
-                existing_parquet_meta.len()
-            )
-        })?;
+    // append_base (the published header, >= the parse anchor) bounds the new
+    // footer's position; the buffer must reach it so finish folds any dead
+    // footer in [parse anchor, append_base) into the cumulative CRC. Guarded
+    // here because append_base comes from the on-disk header: a corrupt value
+    // must error, not panic via JNI.
+    let append_base_len = usize::try_from(append_base).map_err(|_| {
+        parquet_meta_err!(
+            ParquetMetaErrorKind::Truncated,
+            "_pm append base {} exceeds addressable range",
+            append_base
+        )
+    })?;
+    if append_base < existing_parquet_meta_file_size
+        || existing_parquet_meta.len() < append_base_len
+    {
+        return Err(parquet_meta_err!(
+            ParquetMetaErrorKind::InvalidValue,
+            "_pm append base {} out of range [parse anchor {}, available {}]",
+            append_base,
+            existing_parquet_meta_file_size,
+            existing_parquet_meta.len()
+        ));
+    }
 
     // Read the existing _pm to get row group fingerprints (byte_range_start of first column).
     let existing_reader = crate::parquet_metadata::reader::ParquetMetaReader::from_file_size(
@@ -640,11 +685,8 @@ pub fn update_parquet_metadata(
 
     updater.parquet_footer(parquet_footer_offset, parquet_footer_length);
     updater.unused_bytes(unused_bytes);
-    let (append_bytes, new_file_size) = updater.finish()?;
-    debug_assert_eq!(
-        new_file_size,
-        existing_parquet_meta_file_size + append_bytes.len() as u64
-    );
+    let (append_bytes, new_file_size) = updater.finish_appending_at(append_base)?;
+    debug_assert_eq!(new_file_size, append_base + append_bytes.len() as u64);
 
     Ok(ParquetMetaUpdateResult { bytes: append_bytes, new_file_size })
 }
@@ -720,50 +762,87 @@ pub(crate) struct SortingCol {
     descending: bool,
 }
 
+/// The dense position and order of qdb_meta's designated timestamp, or `None`
+/// when there is no designated timestamp.
+fn designated_sorting_col(qdb_meta: &QdbMeta) -> Option<SortingCol> {
+    qdb_meta
+        .schema
+        .iter()
+        .position(|col| col.column_type.is_designated())
+        .map(|pos| SortingCol {
+            column_idx: pos as i32,
+            descending: !qdb_meta.schema[pos]
+                .column_type
+                .is_designated_timestamp_ascending(),
+        })
+}
+
+pub(crate) fn resolve_sorting_columns(
+    file_metadata: &FileMetaData,
+    qdb_meta: Option<&QdbMeta>,
+) -> ParquetResult<Vec<SortingCol>> {
+    match qdb_meta.and_then(designated_sorting_col) {
+        Some(sc) => Ok(vec![sc]),
+        None => extract_sorting_columns(file_metadata),
+    }
+}
+
+/// Sort columns declared in the parquet footer. Row groups that declare none are
+/// skipped -- a legacy O3 merge left copied groups unstamped while fresh ones
+/// carried the timestamp sort column -- so only the declaring groups must agree;
+/// genuinely conflicting orders are rejected.
 pub(crate) fn extract_sorting_columns(
     file_metadata: &FileMetaData,
 ) -> ParquetResult<Vec<SortingCol>> {
-    let mut result: Option<Vec<SortingCol>> = None;
+    let mut reference: Option<(usize, &[SortingColumn])> = None;
 
     for (rg_idx, rg) in file_metadata.row_groups.iter().enumerate() {
-        let current = match rg.sorting_columns() {
-            Some(cols) => cols
-                .iter()
+        let current: &[SortingColumn] = match rg.sorting_columns() {
+            Some(cols) if !cols.is_empty() => cols.as_slice(),
+            _ => continue, // no sorting columns -> ignore this row group
+        };
+
+        let (ref_idx, prev) = match reference {
+            Some(r) => r,
+            None => {
+                reference = Some((rg_idx, current));
+                continue;
+            }
+        };
+
+        if prev.len() != current.len() {
+            return Err(parquet_meta_err!(
+                ParquetMetaErrorKind::SchemaMismatch,
+                "sorting columns differ between row groups: rg {} has {} but rg {} has {}",
+                ref_idx,
+                prev.len(),
+                rg_idx,
+                current.len()
+            ));
+        }
+        for (i, (p, c)) in prev.iter().zip(current.iter()).enumerate() {
+            if p.column_idx != c.column_idx || p.descending != c.descending {
+                return Err(parquet_meta_err!(
+                    ParquetMetaErrorKind::SchemaMismatch,
+                    "sorting column {} differs between row groups {} and {}",
+                    i,
+                    ref_idx,
+                    rg_idx
+                ));
+            }
+        }
+    }
+
+    Ok(reference
+        .map(|(_, cols)| {
+            cols.iter()
                 .map(|sc| SortingCol {
                     column_idx: sc.column_idx,
                     descending: sc.descending,
                 })
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
-
-        if let Some(ref prev) = result {
-            // Validate consistency.
-            if prev.len() != current.len() {
-                return Err(parquet_meta_err!(
-                    ParquetMetaErrorKind::SchemaMismatch,
-                    "sorting columns differ between row groups: rg 0 has {} but rg {} has {}",
-                    prev.len(),
-                    rg_idx,
-                    current.len()
-                ));
-            }
-            for (i, (p, c)) in prev.iter().zip(current.iter()).enumerate() {
-                if p.column_idx != c.column_idx || p.descending != c.descending {
-                    return Err(parquet_meta_err!(
-                        ParquetMetaErrorKind::SchemaMismatch,
-                        "sorting column {} differs between row groups 0 and {}",
-                        i,
-                        rg_idx
-                    ));
-                }
-            }
-        } else {
-            result = Some(current);
-        }
-    }
-
-    Ok(result.unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 pub(crate) fn detect_designated_timestamp(
@@ -844,6 +923,7 @@ mod tests {
             column_top: 0,
             designated_timestamp: true,
             not_null_hint: true,
+            strided_timestamp_16: false,
             designated_timestamp_ascending: true,
             parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
         };
@@ -881,7 +961,7 @@ mod tests {
         let qdb_meta = extract_qdb_meta_from(&metadata);
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -906,7 +986,7 @@ mod tests {
         let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, None, 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, None, 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -921,7 +1001,7 @@ mod tests {
         let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, None, 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, None, 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -943,7 +1023,7 @@ mod tests {
         qdb_meta.squash_tracker = 42;
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, None, None).unwrap();
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
         assert!(reader.feature_flags().has_squash_tracker());
@@ -960,7 +1040,7 @@ mod tests {
         qdb_meta.squash_tracker = -1;
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, None, None).unwrap();
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
         assert!(!reader.feature_flags().has_squash_tracker());
@@ -974,7 +1054,7 @@ mod tests {
         let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, None, 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, None, 0, 0, None, None).unwrap();
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
         assert!(!reader.feature_flags().has_squash_tracker());
@@ -1005,8 +1085,316 @@ mod tests {
                 ascii: None,
             });
 
-        let result = convert_from_parquet(&metadata, Some(&bad_meta), 0, 0, None);
+        let result = convert_from_parquet(&metadata, Some(&bad_meta), 0, 0, None, None);
         assert!(result.is_err());
+    }
+
+    /// Regression: an O3 merge copies unchanged row groups without re-stamping
+    /// the partition's designated-timestamp sort column, so a converted-then-
+    /// merged partition ends up with rg 0 declaring no sorting columns and rg 1
+    /// declaring the timestamp sort column. This is the exact shape Mig941 reads
+    /// from the on-disk footer; extract_sorting_columns used to reject it with
+    /// "rg 0 has 0 but rg 1 has 1" and crash replica bootstrap. It must now
+    /// tolerate the mix while still rejecting genuinely conflicting sort orders.
+    #[test]
+    fn extract_sorting_columns_tolerates_groups_without_sorting() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        // Parse a real file to get a valid FileMetaData shell, then overwrite
+        // its row groups to mimic an O3-merged partition.
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+
+        let ts_sort = vec![SortingColumn::new(0, false, false)];
+        metadata.row_groups = vec![
+            // copied: no sort cols
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            // fresh: ts sort
+            RowGroupMetaData::with_sorting_columns(vec![], 10, Some(ts_sort.clone()), 0),
+        ];
+
+        // Used to error with "rg 0 has 0 but rg 1 has 1"; now tolerated, adopting
+        // the sort columns of the only row group that declares any.
+        let cols = extract_sorting_columns(&metadata)
+            .expect("a mix of empty and non-empty sorting columns must be tolerated");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].column_idx, 0);
+        assert!(!cols[0].descending);
+
+        // Reverse order: rg0 declares the sort column, rg1 declares none -> still tolerated.
+        metadata.row_groups = vec![
+            // fresh: ts sort
+            RowGroupMetaData::with_sorting_columns(vec![], 10, Some(ts_sort.clone()), 0),
+            // copied: no sort cols
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+        ];
+        let cols = extract_sorting_columns(&metadata)
+            .expect("a mix of empty and non-empty sorting columns must be tolerated");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].column_idx, 0);
+        assert!(!cols[0].descending);
+
+        // Two row groups sorted on DIFFERENT columns is a real conflict -> still rejected.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(1, false, false)]),
+                0,
+            ),
+        ];
+        assert!(extract_sorting_columns(&metadata).is_err());
+
+        // Two row groups that declare a DIFFERENT number of sorting columns is
+        // also a real conflict -> still rejected.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![
+                    SortingColumn::new(0, false, false),
+                    SortingColumn::new(1, false, false),
+                ]),
+                0,
+            ),
+        ];
+        assert!(extract_sorting_columns(&metadata).is_err());
+
+        // Same column but OPPOSITE sort direction is a real conflict -> still rejected.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, true, false)]),
+                0,
+            ),
+        ];
+        assert!(extract_sorting_columns(&metadata).is_err());
+    }
+
+    /// Regression: extract_sorting_columns must stay correct with MORE than two
+    /// row groups, where non-declaring (no-sort-column) groups are interleaved
+    /// among declaring ones. A partition that is converted and then O3-merged
+    /// repeatedly accumulates several copied groups (no sorting columns) around
+    /// freshly written ones (the timestamp sort column). The two-row-group tests
+    /// never adopt the reference from a non-first group and then hit a conflict
+    /// on a later, non-adjacent group; this one does.
+    #[test]
+    fn extract_sorting_columns_handles_many_row_groups() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+
+        let ts_sort = || Some(vec![SortingColumn::new(0, false, false)]);
+
+        // Four groups; sorting columns declared only on the inner two, with empty
+        // groups before, between, and after -> tolerated, adopting [ts].
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(vec![], 10, ts_sort(), 0),
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(vec![], 10, ts_sort(), 0),
+        ];
+        let cols = extract_sorting_columns(&metadata)
+            .expect("interleaved empty and matching groups must be tolerated");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].column_idx, 0);
+        assert!(!cols[0].descending);
+
+        // Reference adopted from a non-first group (rg1), conflict on a later,
+        // non-adjacent group (rg3) -> rejected. rg0 and rg2 are skipped.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(1, false, false)]),
+                0,
+            ),
+        ];
+        assert!(
+            extract_sorting_columns(&metadata).is_err(),
+            "a conflicting sort column on a later group must still be rejected"
+        );
+
+        // Conflict expressed as a differing sort-column COUNT on a later group.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![
+                    SortingColumn::new(0, false, false),
+                    SortingColumn::new(1, false, false),
+                ]),
+                0,
+            ),
+        ];
+        assert!(
+            extract_sorting_columns(&metadata).is_err(),
+            "a differing sort-column count on a later group must still be rejected"
+        );
+    }
+
+    /// End-to-end: the full Mig941 conversion (resolve_sorting_columns ->
+    /// detect_designated_timestamp -> _pm writer -> ParquetMetaReader), not just
+    /// extract_sorting_columns in isolation, must tolerate an O3-merged footer
+    /// that mixes a copied row group (no sort cols) with a fresh one (the ts
+    /// sort col) and still record the designated timestamp. This is the exact
+    /// path that threw "rg 0 has 0 but rg 1 has 1" and crashed replica bootstrap.
+    #[test]
+    fn convert_from_parquet_tolerates_mixed_sorting_columns() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        // A real, valid file (real column chunks + QdbMeta), ts sort column at col 0.
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata).expect("test parquet has qdb meta");
+
+        // Reshape into the O3-merged footer shape, carrying the REAL column chunks
+        // so convert_from_parquet's per-row-group column walk runs for real: rg0
+        // copied (no sort cols), rg1 fresh (ts sort col).
+        let cols = metadata.row_groups[0].columns().to_vec();
+        let n = metadata.row_groups[0].num_rows();
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(cols.clone(), n, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                cols,
+                n,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                1,
+            ),
+        ];
+
+        // The full conversion must succeed and still record the designated ts.
+        let (pm_bytes, pm_size) =
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, None, None)
+                .expect("convert_from_parquet must tolerate the mixed O3 footer");
+        let reader = ParquetMetaReader::from_file_size(&pm_bytes, pm_size).unwrap();
+        assert_eq!(reader.designated_timestamp(), Some(0));
+        assert_eq!(reader.sorting_column_count(), 1);
+        assert_eq!(reader.sorting_column(0).unwrap(), 0);
+    }
+
+    /// C1 regression: across a version upgrade an update-mode O3 merge can leave a
+    /// footer whose declaring row groups disagree -- a cached group with the stale
+    /// index 1, a freshly appended group with the corrected index 0. The footer
+    /// reader rejects that, but the migration must trust qdb_meta and not abort.
+    #[test]
+    fn convert_from_parquet_tolerates_conflicting_sort_indices_via_qdb_meta() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        // Real, valid file with qdb_meta designating the timestamp at column 0.
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata).expect("test parquet has qdb meta");
+
+        // Footer shape: copied group (no sort col), legacy stale [1], corrected [0].
+        let cols = metadata.row_groups[0].columns().to_vec();
+        let n = metadata.row_groups[0].num_rows();
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(cols.clone(), n, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                cols.clone(),
+                n,
+                Some(vec![SortingColumn::new(1, false, false)]),
+                1,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                cols,
+                n,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                2,
+            ),
+        ];
+
+        // The footer reader alone rejects this; the migration must not.
+        assert!(extract_sorting_columns(&metadata).is_err());
+
+        let (pm_bytes, pm_size) =
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, None, None)
+                .expect("convert_from_parquet must resolve sorting from qdb_meta, not the footer");
+        let reader = ParquetMetaReader::from_file_size(&pm_bytes, pm_size).unwrap();
+        assert_eq!(reader.designated_timestamp(), Some(0));
+        assert_eq!(reader.sorting_column_count(), 1);
+        // The dense designated position (0), not the stale footer index 1.
+        assert_eq!(reader.sorting_column(0).unwrap(), 0);
+
+        // Scoped to QuestDB files: without qdb_meta the conflict still aborts.
+        assert!(convert_from_parquet(&metadata, None, 0, 0, None, None).is_err());
+    }
+
+    /// extract_sorting_columns returns an empty set for a footer with no row groups.
+    #[test]
+    fn extract_sorting_columns_handles_zero_row_groups() {
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        metadata.row_groups = vec![];
+        let cols = extract_sorting_columns(&metadata).expect("zero row groups is valid");
+        assert!(cols.is_empty());
+    }
+
+    /// A present-but-empty sorting vector is skipped like None, not treated as a
+    /// conflict against a sibling group that declares a real sort column.
+    #[test]
+    fn extract_sorting_columns_skips_empty_present_sorting_columns() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+
+        metadata.row_groups = vec![
+            // present but empty -> treated as "no sorting columns", skipped.
+            RowGroupMetaData::with_sorting_columns(vec![], 10, Some(vec![]), 0),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+        ];
+        let cols = extract_sorting_columns(&metadata)
+            .expect("an empty-but-present sorting vector must be skipped, not conflict");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].column_idx, 0);
     }
 
     fn leak_bytes(data: &[u8]) -> &'static [u8] {
@@ -1048,6 +1436,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: true,
                 not_null_hint: true,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: true,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             },
@@ -1062,6 +1451,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: false,
                 not_null_hint: false,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: false,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             },
@@ -1076,6 +1466,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: false,
                 not_null_hint: false,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: false,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             },
@@ -1090,6 +1481,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: false,
                 not_null_hint: false,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: false,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             },
@@ -1116,7 +1508,7 @@ mod tests {
         let qdb_meta = extract_qdb_meta_from(&metadata);
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 1024, 200, None).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 1024, 200, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -1191,6 +1583,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: true,
                 not_null_hint: true,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: true,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             },
@@ -1205,6 +1598,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: false,
                 not_null_hint: false,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: false,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             },
@@ -1226,7 +1620,7 @@ mod tests {
         let qdb_meta = extract_qdb_meta_from(&metadata);
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -1359,7 +1753,7 @@ mod tests {
         });
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, Some(&meta), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, Some(&meta), 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -1372,36 +1766,26 @@ mod tests {
 
     #[test]
     fn convert_sorting_columns_propagated() {
-        // Write a parquet file with a designated timestamp - ParquetWriter
-        // should set sorting columns in the row group metadata.
+        // Write a parquet file with a designated timestamp. qdb_meta marks the
+        // designated column, which resolve_sorting_columns treats as
+        // authoritative for the _pm sort column -- so it is recorded at its
+        // dense position even when the footer's row groups omit sorting columns.
         let parquet_data = write_test_parquet(100, CompressionOptions::Uncompressed);
         let mut cursor = Cursor::new(&parquet_data);
         let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
 
-        // Check if sorting columns are actually present in the parquet metadata.
-        let has_sorting = metadata.row_groups.iter().any(|rg| {
-            rg.sorting_columns()
-                .as_ref()
-                .is_some_and(|sc| !sc.is_empty())
-        });
-
         let qdb_meta = extract_qdb_meta_from(&metadata);
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
 
-        if has_sorting {
-            assert!(reader.sorting_column_count() > 0);
-            assert_eq!(reader.sorting_column(0).unwrap(), 0);
-        } else {
-            // If the writer doesn't set sorting columns, they won't appear.
-            assert_eq!(reader.sorting_column_count(), 0);
-        }
-
-        // Designated timestamp should still be detected from QdbMeta.
+        // The designated timestamp (from qdb_meta) is the sole sort column, at
+        // its dense position (0).
         assert!(reader.designated_timestamp().is_some());
+        assert_eq!(reader.sorting_column_count(), 1);
+        assert_eq!(reader.sorting_column(0).unwrap(), 0);
     }
 
     #[test]
@@ -1424,6 +1808,7 @@ mod tests {
             column_top: 0,
             designated_timestamp: true,
             not_null_hint: true,
+            strided_timestamp_16: false,
             designated_timestamp_ascending: true,
             parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
         };
@@ -1447,7 +1832,7 @@ mod tests {
 
         let qdb_meta = extract_qdb_meta_from(&metadata);
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -1477,6 +1862,7 @@ mod tests {
             column_top: 0,
             designated_timestamp: false,
             not_null_hint: false,
+            strided_timestamp_16: false,
             designated_timestamp_ascending: false,
             parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
         };
@@ -1505,7 +1891,7 @@ mod tests {
         let qdb_meta = extract_qdb_meta_from(&metadata);
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -1528,7 +1914,7 @@ mod tests {
         let qdb_meta = extract_qdb_meta_from(&metadata);
 
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, None).unwrap();
 
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
@@ -1568,7 +1954,7 @@ mod tests {
 
         // Path 1: convert_from_parquet
         let (parquet_meta_bytes_from_meta, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, None).unwrap();
         let reader1 = ParquetMetaReader::from_file_size(
             &parquet_meta_bytes_from_meta,
             parquet_meta_file_size,
@@ -1781,6 +2167,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: true,
                 not_null_hint: true,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: true,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             }],
@@ -1957,9 +2344,17 @@ mod tests {
         }
         extended_rgs.push(new_rg);
 
-        let result =
-            update_parquet_metadata(&initial_pm, initial_size, &extended_rgs, 200, 60, &[], 0)
-                .unwrap();
+        let result = update_parquet_metadata(
+            &initial_pm,
+            initial_size,
+            initial_size,
+            &extended_rgs,
+            200,
+            60,
+            &[],
+            0,
+        )
+        .unwrap();
 
         assert!(!result.bytes.is_empty(), "should have append bytes");
 
@@ -1985,6 +2380,85 @@ mod tests {
         // obtained before the new snapshot was published.
         let old_reader = ParquetMetaReader::from_file_size(&initial_pm, initial_size).unwrap();
         assert_eq!(old_reader.row_group_count(), 1);
+    }
+
+    #[test]
+    fn update_parquet_metadata_appends_past_dead_footer() {
+        let parquet_data = write_multi_column_parquet(80);
+        let mut cursor = Cursor::new(&parquet_data);
+        let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata);
+        let thrift_meta = metadata.into_thrift();
+
+        let mut cursor2 = Cursor::new(&parquet_data);
+        let metadata2 = read_metadata_with_size(&mut cursor2, parquet_data.len() as u64).unwrap();
+        let col_infos = col_infos_from_schema(metadata2.schema_descr.columns(), qdb_meta.as_ref());
+
+        let (initial_pm, _) = generate_parquet_metadata(
+            &col_infos,
+            &thrift_meta.row_groups,
+            0,
+            &[0],
+            100,
+            50,
+            &[],
+            0,
+            -1,
+        )
+        .unwrap();
+        let s0 = initial_pm.len() as u64;
+
+        // Two-row-group target: the original row group (unchanged) plus a new one.
+        let mut extended_rgs = thrift_meta.row_groups.clone();
+        let mut new_rg = extended_rgs[0].clone();
+        for col in &mut new_rg.columns {
+            if let Some(ref mut meta) = col.meta_data {
+                meta.data_page_offset += 10_000; // different fingerprint -> treated as new
+            }
+        }
+        extended_rgs.push(new_rg);
+
+        // Crash window: a prior update published a footer at [s0, s1) (header
+        // patched to s1) then crashed before its `_txn` commit. The committed
+        // head stays s0 (the dead footer never matched `_txn`).
+        let dead = update_parquet_metadata(&initial_pm, s0, s0, &extended_rgs, 200, 60, &[], 0)
+            .unwrap()
+            .bytes;
+        let mut physical_after_fail = initial_pm.clone();
+        physical_after_fail.extend_from_slice(&dead);
+        let s1 = physical_after_fail.len() as u64;
+        assert!(s1 > s0, "dead footer must extend the physical file");
+
+        // The next successful update parses the committed head (s0) and appends
+        // past the dead footer at the append base (the dirty-ahead header, s1).
+        let result =
+            update_parquet_metadata(&physical_after_fail, s0, s1, &extended_rgs, 300, 70, &[], 0)
+                .unwrap();
+        assert_eq!(result.new_file_size, s1 + result.bytes.len() as u64);
+
+        let mut full = physical_after_fail.clone();
+        full.extend_from_slice(&result.bytes);
+        full[crate::parquet_metadata::types::HEADER_PARQUET_META_FILE_SIZE_OFF
+            ..crate::parquet_metadata::types::HEADER_PARQUET_META_FILE_SIZE_OFF + 8]
+            .copy_from_slice(&result.new_file_size.to_le_bytes());
+
+        // The writer appended only past s1: committed + dead bytes untouched
+        // (bar the header size field), and the dead footer is byte-identical.
+        assert_eq!(&full[8..s1 as usize], &physical_after_fail[8..s1 as usize]);
+        assert_eq!(&full[s0 as usize..s1 as usize], &dead[..]);
+
+        // A reader at the new committed size verifies the cumulative CRC, which
+        // now spans the dead region, and the new footer chains onto s0 --
+        // orphaning the dead footer out of the MVCC chain.
+        let new_reader = ParquetMetaReader::from_file_size(&full, result.new_file_size).unwrap();
+        new_reader.verify_checksum().unwrap();
+        assert_eq!(new_reader.row_group_count(), 2);
+        assert_eq!(new_reader.prev_parquet_meta_file_size(), s0);
+
+        // The committed snapshot still resolves independently at s0.
+        let old_reader = ParquetMetaReader::from_file_size(&initial_pm, s0).unwrap();
+        assert_eq!(old_reader.row_group_count(), 1);
+        old_reader.verify_checksum().unwrap();
     }
 
     /// Builds a `Vec<ParquetMetaColumnInfo>` from the given parquet schema and
@@ -2066,7 +2540,16 @@ mod tests {
 
         // Drop the third row group and ask for an update with only 2.
         let two_rgs = three_rgs[..2].to_vec();
-        let result = update_parquet_metadata(&initial_pm, initial_size, &two_rgs, 100, 50, &[], 0);
+        let result = update_parquet_metadata(
+            &initial_pm,
+            initial_size,
+            initial_size,
+            &two_rgs,
+            100,
+            50,
+            &[],
+            0,
+        );
 
         let err = match result {
             Ok(_) => panic!("update should fail when row groups shrink"),
@@ -2081,6 +2564,72 @@ mod tests {
             msg.contains("escalate to rewrite mode"),
             "expected escalation hint in error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn update_rejects_invalid_append_base() {
+        // The append base comes from the on-disk `_pm` header; a corrupt value
+        // must error (not panic via JNI) before any parsing. Build a valid
+        // 1-row-group `_pm` and a 2-row-group target that would otherwise
+        // append cleanly, then drive the guard with three bad append bases.
+        let parquet_data = write_multi_column_parquet(80);
+        let mut cursor = Cursor::new(&parquet_data);
+        let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata);
+        let thrift_meta = metadata.into_thrift();
+
+        let mut cursor2 = Cursor::new(&parquet_data);
+        let metadata2 = read_metadata_with_size(&mut cursor2, parquet_data.len() as u64).unwrap();
+        let col_infos = col_infos_from_schema(metadata2.schema_descr.columns(), qdb_meta.as_ref());
+
+        let (initial_pm, _) = generate_parquet_metadata(
+            &col_infos,
+            &thrift_meta.row_groups,
+            0,
+            &[0],
+            100,
+            50,
+            &[],
+            0,
+            -1,
+        )
+        .unwrap();
+        let parse_anchor = initial_pm.len() as u64;
+
+        // A 2-row-group target so the update is well-formed apart from the base.
+        let mut extended_rgs = thrift_meta.row_groups.clone();
+        let mut new_rg = extended_rgs[0].clone();
+        for col in &mut new_rg.columns {
+            if let Some(ref mut meta) = col.meta_data {
+                meta.data_page_offset += 10_000;
+            }
+        }
+        extended_rgs.push(new_rg);
+
+        // parse_anchor - 1: below the committed head; parse_anchor + 1: one byte
+        // past the buffer end; u64::MAX: still addressable as usize on 64-bit, so
+        // it trips the buffer-length check rather than the try_from overflow.
+        for &bad_base in &[parse_anchor - 1, parse_anchor + 1, u64::MAX] {
+            let result = update_parquet_metadata(
+                &initial_pm,
+                parse_anchor,
+                bad_base,
+                &extended_rgs,
+                200,
+                60,
+                &[],
+                0,
+            );
+            let err = match result {
+                Ok(_) => panic!("append base {bad_base} must be rejected"),
+                Err(e) => e,
+            };
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("append base") && msg.contains("out of range"),
+                "append base {bad_base}: expected an 'out of range' guard error, got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -2136,6 +2685,7 @@ mod tests {
             column_top: 0,
             designated_timestamp: true,
             not_null_hint: true,
+            strided_timestamp_16: false,
             designated_timestamp_ascending: true,
             parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
         };
@@ -2237,6 +2787,330 @@ mod tests {
         );
     }
 
+    /// Writes a parquet file with a bloom filter on the `id` column. Returns
+    /// the raw parquet bytes; the migration path mmaps these bytes and hands
+    /// them to `convert_from_parquet` as `parquet_file_data`.
+    fn write_parquet_with_bloom_filter() -> Vec<u8> {
+        let row_count = 100usize;
+        let ts_data: Vec<i64> = (0..row_count as i64).collect();
+        let ts_bytes: &'static [u8] = Box::leak(
+            unsafe { std::slice::from_raw_parts(ts_data.as_ptr() as *const u8, ts_data.len() * 8) }
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let id_data: Vec<i32> = (0..row_count as i32).collect();
+        let id_bytes: &'static [u8] = Box::leak(
+            unsafe { std::slice::from_raw_parts(id_data.as_ptr() as *const u8, id_data.len() * 4) }
+                .to_vec()
+                .into_boxed_slice(),
+        );
+
+        let cols = vec![
+            Column {
+                name: "ts",
+                data_type: ColumnTypeTag::Timestamp.into_type(),
+                id: 0,
+                row_count,
+                primary_data: ts_bytes,
+                secondary_data: &[],
+                symbol_offsets: &[],
+                column_top: 0,
+                designated_timestamp: true,
+                not_null_hint: true,
+                strided_timestamp_16: false,
+                designated_timestamp_ascending: true,
+                parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
+            },
+            Column {
+                name: "id",
+                data_type: ColumnTypeTag::Int.into_type(),
+                id: 1,
+                row_count,
+                primary_data: id_bytes,
+                secondary_data: &[],
+                symbol_offsets: &[],
+                column_top: 0,
+                designated_timestamp: false,
+                not_null_hint: true,
+                strided_timestamp_16: false,
+                designated_timestamp_ascending: false,
+                parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
+            },
+        ];
+        let partition = Partition { table: "bloom".to_string(), columns: cols };
+
+        let mut buf = Vec::new();
+        ParquetWriter::new(&mut buf)
+            .with_statistics(true)
+            .with_version(Version::V1)
+            .with_row_group_size(Some(row_count))
+            .with_bloom_filter_columns([1].into_iter().collect())
+            .with_bloom_filter_fpp(0.01)
+            .finish(partition)
+            .unwrap();
+        buf
+    }
+
+    /// Migration path: when the caller passes the parquet bytes, the bloom
+    /// filter bitset is read out of the parquet footer and inlined into the
+    /// `_pm` out-of-line region. Covers the new `parquet_file_data: Some(...)`
+    /// branch in `convert_from_parquet`.
+    #[test]
+    fn convert_from_parquet_inlines_bloom_filter_from_slice() {
+        let parquet_data = write_parquet_with_bloom_filter();
+
+        let mut cursor = Cursor::new(&parquet_data);
+        let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata);
+
+        // Sanity: the parquet footer carries a bloom_filter_offset for `id`.
+        let id_meta = metadata.row_groups[0].columns()[1].metadata();
+        assert!(
+            id_meta.bloom_filter_offset.is_some_and(|o| o > 0),
+            "test parquet should carry a bloom_filter_offset on the id column"
+        );
+
+        let (pm_bytes, pm_file_size) = convert_from_parquet(
+            &metadata,
+            qdb_meta.as_ref(),
+            0,
+            0,
+            None,
+            Some(parquet_data.as_slice()),
+        )
+        .unwrap();
+
+        let reader = ParquetMetaReader::from_file_size(&pm_bytes, pm_file_size).unwrap();
+        assert!(
+            reader.has_bloom_filters(),
+            "BLOOM_FILTERS feature flag should be set when bloom filters are inlined"
+        );
+        // Column 0 (ts) has no bloom filter; column 1 (id) does. The footer
+        // section is one entry deep.
+        assert_eq!(reader.bloom_filter_position(0), None);
+        let id_pos = reader
+            .bloom_filter_position(1)
+            .expect("id column should have a bloom filter footer entry");
+        let bf_abs = reader.bloom_filter_offset_in_pm(0, id_pos).unwrap() as usize;
+        assert_ne!(bf_abs, 0, "inlined bloom filter offset should be non-zero");
+        let bf_len = i32::from_le_bytes(pm_bytes[bf_abs..bf_abs + 4].try_into().unwrap()) as usize;
+        assert!(bf_len >= 32, "inlined bitset must be at least 32 bytes");
+        let inlined_bitset = &pm_bytes[bf_abs + 4..bf_abs + 4 + bf_len];
+        assert!(
+            inlined_bitset.iter().any(|&b| b != 0),
+            "inlined bloom bitset should have at least one bit set for 100 values"
+        );
+    }
+
+    /// Migration path: when the caller does NOT pass parquet bytes (i.e. it
+    /// has not mmapped the file), bloom filters are not inlined and `_pm`
+    /// does not carry the BLOOM_FILTERS feature flag, even though the parquet
+    /// footer would have allowed it. Anchors the `parquet_file_data: None`
+    /// branch so a future change that flips it on by default fails the test.
+    #[test]
+    fn convert_from_parquet_skips_bloom_inline_without_parquet_data() {
+        let parquet_data = write_parquet_with_bloom_filter();
+
+        let mut cursor = Cursor::new(&parquet_data);
+        let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata);
+
+        let (pm_bytes, pm_file_size) =
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, None).unwrap();
+
+        let reader = ParquetMetaReader::from_file_size(&pm_bytes, pm_file_size).unwrap();
+        assert!(
+            !reader.has_bloom_filters(),
+            "BLOOM_FILTERS flag must stay off when parquet_file_data is None"
+        );
+    }
+
+    /// Migration path error case: the caller passes a truncated view of the
+    /// parquet file that does not extend to the bloom_filter_offset recorded
+    /// in the footer. `parquet2::bloom_filter::read_from_slice_at_offset`
+    /// rejects this, the converter wraps the error with a Conversion kind,
+    /// and the failure surfaces to the caller rather than silently producing
+    /// a `_pm` without the bloom filter the footer claims. Covers the
+    /// `map_err` branch in the bloom-inline block.
+    #[test]
+    fn convert_from_parquet_propagates_bloom_read_error_on_truncated_slice() {
+        let parquet_data = write_parquet_with_bloom_filter();
+
+        let mut cursor = Cursor::new(&parquet_data);
+        let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata);
+
+        let bloom_offset = metadata.row_groups[0].columns()[1]
+            .metadata()
+            .bloom_filter_offset
+            .expect("test parquet should carry a bloom_filter_offset")
+            as usize;
+        // Truncate the parquet bytes before the bloom-filter region so the
+        // converter's read of the bitset at `bloom_offset` fails.
+        let truncated = &parquet_data[..bloom_offset.saturating_sub(1)];
+
+        let err = convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None, Some(truncated))
+            .expect_err("truncated parquet_file_data should fail bloom-filter read");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("could not read parquet bloom filter at offset"),
+            "error message should mention bloom filter read failure, got: {msg}"
+        );
+    }
+
+    /// Migration path: a parquet with two bloom-filtered columns split across
+    /// two row groups must inline a distinct bitset for every (row group,
+    /// column) pair. Guards against a regression that copies one bitset to all
+    /// row groups, drops all but the last, or overlaps per-column bitsets in
+    /// the `_pm` out-of-line region.
+    #[test]
+    fn convert_from_parquet_inlines_bloom_filters_across_row_groups_and_columns() {
+        let parquet_data = write_parquet_with_two_bloom_columns_two_row_groups();
+
+        let mut cursor = Cursor::new(&parquet_data);
+        let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata);
+        assert_eq!(
+            metadata.row_groups.len(),
+            2,
+            "test parquet should have two row groups"
+        );
+
+        let (pm_bytes, pm_file_size) = convert_from_parquet(
+            &metadata,
+            qdb_meta.as_ref(),
+            0,
+            0,
+            None,
+            Some(&parquet_data),
+        )
+        .unwrap();
+
+        let reader = ParquetMetaReader::from_file_size(&pm_bytes, pm_file_size).unwrap();
+        assert!(reader.has_bloom_filters());
+        assert_eq!(
+            reader.bloom_filter_position(0),
+            None,
+            "ts column carries no bloom filter"
+        );
+        let pos_a = reader
+            .bloom_filter_position(1)
+            .expect("column 1 should have a bloom filter");
+        let pos_b = reader
+            .bloom_filter_position(2)
+            .expect("column 2 should have a bloom filter");
+
+        let mut offsets = Vec::with_capacity(4);
+        for rg in 0..2usize {
+            for pos in [pos_a, pos_b] {
+                let off = reader.bloom_filter_offset_in_pm(rg, pos).unwrap() as usize;
+                assert_ne!(off, 0, "each (row group, column) pair must inline a bitset");
+                let len = i32::from_le_bytes(pm_bytes[off..off + 4].try_into().unwrap()) as usize;
+                assert!(len >= 32, "inlined bitset must be at least 32 bytes");
+                let bitset = &pm_bytes[off + 4..off + 4 + len];
+                assert!(
+                    bitset.iter().any(|&b| b != 0),
+                    "inlined bloom bitset should have at least one bit set"
+                );
+                offsets.push(off);
+            }
+        }
+        let mut distinct = offsets.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            offsets.len(),
+            "every (row group, column) bloom bitset must occupy a distinct _pm offset"
+        );
+    }
+
+    fn write_parquet_with_two_bloom_columns_two_row_groups() -> Vec<u8> {
+        let row_count = 100usize;
+        let ts_data: Vec<i64> = (0..row_count as i64).collect();
+        let ts_bytes: &'static [u8] = Box::leak(
+            unsafe { std::slice::from_raw_parts(ts_data.as_ptr() as *const u8, ts_data.len() * 8) }
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let a_data: Vec<i32> = (0..row_count as i32).collect();
+        let a_bytes: &'static [u8] = Box::leak(
+            unsafe { std::slice::from_raw_parts(a_data.as_ptr() as *const u8, a_data.len() * 4) }
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let b_data: Vec<i32> = (0..row_count as i32)
+            .map(|x| x.wrapping_mul(7) + 3)
+            .collect();
+        let b_bytes: &'static [u8] = Box::leak(
+            unsafe { std::slice::from_raw_parts(b_data.as_ptr() as *const u8, b_data.len() * 4) }
+                .to_vec()
+                .into_boxed_slice(),
+        );
+
+        let cols = vec![
+            Column {
+                name: "ts",
+                data_type: ColumnTypeTag::Timestamp.into_type(),
+                id: 0,
+                row_count,
+                primary_data: ts_bytes,
+                secondary_data: &[],
+                symbol_offsets: &[],
+                column_top: 0,
+                designated_timestamp: true,
+                not_null_hint: true,
+                strided_timestamp_16: false,
+                designated_timestamp_ascending: true,
+                parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
+            },
+            Column {
+                name: "a",
+                data_type: ColumnTypeTag::Int.into_type(),
+                id: 1,
+                row_count,
+                primary_data: a_bytes,
+                secondary_data: &[],
+                symbol_offsets: &[],
+                column_top: 0,
+                designated_timestamp: false,
+                not_null_hint: true,
+                strided_timestamp_16: false,
+                designated_timestamp_ascending: false,
+                parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
+            },
+            Column {
+                name: "b",
+                data_type: ColumnTypeTag::Int.into_type(),
+                id: 2,
+                row_count,
+                primary_data: b_bytes,
+                secondary_data: &[],
+                symbol_offsets: &[],
+                column_top: 0,
+                designated_timestamp: false,
+                not_null_hint: true,
+                strided_timestamp_16: false,
+                designated_timestamp_ascending: false,
+                parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
+            },
+        ];
+        let partition = Partition { table: "bloom".to_string(), columns: cols };
+
+        let mut buf = Vec::new();
+        ParquetWriter::new(&mut buf)
+            .with_statistics(true)
+            .with_version(Version::V1)
+            // Half the rows per group yields two row groups.
+            .with_row_group_size(Some(row_count / 2))
+            .with_bloom_filter_columns([1, 2].into_iter().collect())
+            .with_bloom_filter_fpp(0.01)
+            .finish(partition)
+            .unwrap();
+        buf
+    }
+
     #[test]
     fn uuid_ool_stats_round_trip() {
         // Write a parquet file with a UUID column + timestamp column.
@@ -2272,6 +3146,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: true,
                 not_null_hint: true,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: true,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             },
@@ -2286,6 +3161,7 @@ mod tests {
                 column_top: 0,
                 designated_timestamp: false,
                 not_null_hint: false,
+                strided_timestamp_16: false,
                 designated_timestamp_ascending: false,
                 parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
             },
@@ -2428,6 +3304,7 @@ mod tests {
             column_top: 0,
             designated_timestamp: false,
             not_null_hint: false,
+            strided_timestamp_16: false,
             designated_timestamp_ascending: true,
             parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
         };
@@ -2468,15 +3345,15 @@ mod tests {
     }
 
     /// Regenerates the committed test fixture consumed by
-    /// `Mig940Test#testMigrateBackfillsMissingTsStats`. Run with
-    /// `cargo test emit_mig940_ts_no_stats_fixture -- --ignored` after
+    /// `Mig941Test#testMigrateBackfillsMissingTsStats`. Run with
+    /// `cargo test emit_mig941_ts_no_stats_fixture -- --ignored` after
     /// changing the parquet write path in a way that affects the fixture.
     #[test]
     #[ignore]
-    fn emit_mig940_ts_no_stats_fixture() {
+    fn emit_mig941_ts_no_stats_fixture() {
         let (bytes, _qdb_meta) = write_parquet_without_ts_stats(20, 10);
         let out = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../src/test/resources/mig940/ts_no_stats.parquet");
+            .join("../../src/test/resources/mig941/ts_no_stats.parquet");
         std::fs::create_dir_all(out.parent().unwrap()).unwrap();
         std::fs::write(&out, &bytes).unwrap();
         eprintln!("wrote {} bytes to {}", bytes.len(), out.display());
@@ -2490,7 +3367,7 @@ mod tests {
 
         let backfill = |_rg: usize, _lo: usize, _hi: usize| -> ParquetResult<i64> { Ok(42) };
         let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, Some(&backfill)).unwrap();
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, Some(&backfill), None).unwrap();
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
         let chunk = reader.row_group(0).unwrap().column_chunk(0).unwrap();
@@ -2522,6 +3399,7 @@ mod tests {
             panic!("backfill must not be called when inline stats exist");
         };
         let (_parquet_meta_bytes, _parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, Some(&backfill)).unwrap();
+            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, Some(&backfill), None)
+                .unwrap();
     }
 }

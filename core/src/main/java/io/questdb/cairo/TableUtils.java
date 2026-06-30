@@ -114,8 +114,10 @@ public final class TableUtils {
     public static final int LONGS_PER_TX_ATTACHED_PARTITION_MSB = Numbers.msb(LONGS_PER_TX_ATTACHED_PARTITION);
     public static final long META_COLUMN_DATA_SIZE = 32;
     public static final String META_FILE_NAME = "_meta";
-    public static final short META_FORMAT_MINOR_VERSION_LATEST = 1;
+    public static final short META_FORMAT_MINOR_VERSION_LATEST = 2;
     public static final short META_FORMAT_MINOR_VERSION_PARQUET_ENCODING_CONFIG = 1;
+    public static final short META_FORMAT_MINOR_VERSION_TABLE_FORMAT = 2;
+    public static final short META_FORMAT_MINOR_VERSION_TTL = 1;
     public static final long META_OFFSET_COLUMN_TYPES = 128;
     public static final long META_OFFSET_COUNT = 0;
     public static final long META_OFFSET_MAX_UNCOMMITTED_ROWS = 20; // INT
@@ -130,6 +132,7 @@ public final class TableUtils {
     public static final long META_OFFSET_WAL_ENABLED = 40; // BOOLEAN
     public static final long META_OFFSET_META_FORMAT_MINOR_VERSION = META_OFFSET_WAL_ENABLED + 1; // INT
     public static final long META_OFFSET_TTL_HOURS_OR_MONTHS = META_OFFSET_META_FORMAT_MINOR_VERSION + 4; // INT
+    public static final long META_OFFSET_TABLE_FORMAT = META_OFFSET_TTL_HOURS_OR_MONTHS + 4; // INT
     public static final String META_PREV_FILE_NAME = "_meta.prev";
     public static final String META_SWAP_FILE_NAME = "_meta.swp";
     public static final int MIN_INDEX_VALUE_BLOCK_SIZE = Numbers.ceilPow2(2);
@@ -142,8 +145,13 @@ public final class TableUtils {
     public static final String RESTORE_FROM_CHECKPOINT_TRIGGER_FILE_NAME = "_restore";
     public static final String SYMBOL_KEY_REMAP_FILE_SUFFIX = ".r";
     public static final char SYSTEM_TABLE_NAME_SUFFIX = '~';
+    // Writer lock reason used by internal system jobs (partition/posting-seal purge,
+    // CSV copy status) when they acquire a TableWriter on behalf of the engine itself.
+    public static final String SYSTEM_WRITER_LOCK_REASON = "QuestDB system";
     public static final int TABLE_DOES_NOT_EXIST = 1;
     public static final int TABLE_EXISTS = 0;
+    public static final int TABLE_FORMAT_NATIVE = 0;
+    public static final int TABLE_FORMAT_PARQUET = 1;
     // Regular data table kind
     public static final int TABLE_KIND_REGULAR_TABLE = 0;
     // Parquet export table kind - allows table creation in read-only mode for parquet exports
@@ -155,6 +163,10 @@ public final class TableUtils {
     public static final int TABLE_TYPE_VIEW = 3;
     public static final int TABLE_TYPE_WAL = 1;
     public static final String TAB_INDEX_FILE_NAME = "_tab_index.d";
+    // Dot-prefixed db-root staging dir for ALTER TABLE ... REBASE WAL (mirrors ".download"/".checkpoint").
+    // The startup table-dir scans only consider immediate db-root children that are complete tables and
+    // never recurse, so the in-progress clone built inside here is invisible until renamed into place.
+    public static final String REBASE_TMP_DIR = ".rebase";
     public static final String TODO_FILE_NAME = "_todo_";
     /**
      * TXN file structure
@@ -346,9 +358,26 @@ public final class TableUtils {
     public static long checkMemSize(MemoryMR metaMem, long minSize) {
         final long memSize = metaMem.size();
         if (memSize < minSize) {
-            throw CairoException.critical(0).put("File is too small, size=").put(memSize).put(", required=").put(minSize);
+            throw CairoException.fileTooSmall(memSize, minSize);
         }
         return memSize;
+    }
+
+    public static boolean checkStoragePolicyTtl(
+            TxReader txReader,
+            TimestampDriver timestampDriver,
+            long partitionTimestamp,
+            long maxTimestamp,
+            int ttl
+    ) {
+        assert ttl != 0 : "ttl cannot be 0, invalid value";
+        // Storage policies measure age from the partition's own floor (its start), not its
+        // ceiling like table TTL does. This shifts every threshold forward by one partition
+        // width relative to table TTL. For an interval up to one partition width, that means a
+        // partition becomes eligible as soon as the next (active) partition begins; for larger
+        // intervals it simply becomes eligible one partition width sooner than table TTL would.
+        final long partitionFloor = txReader.getPartitionFloor(partitionTimestamp);
+        return isOlderThanTtl(timestampDriver, partitionFloor, maxTimestamp, ttl);
     }
 
     public static boolean checkTtl(
@@ -359,11 +388,11 @@ public final class TableUtils {
             int ttl
     ) {
         assert ttl != 0 : "ttl cannot be 0, invalid value";
+        // Table TTL measures age from the partition ceiling (the start of the next logical
+        // partition), so a partition expires only once even its newest possible record is
+        // older than the TTL.
         final long partitionCeiling = txReader.getNextLogicalPartitionTimestamp(partitionTimestamp);
-        // TTL < 0 means it's in months
-        return ttl > 0
-                ? maxTimestamp - partitionCeiling >= timestampDriver.fromHours(ttl)
-                : timestampDriver.monthsBetween(partitionCeiling, maxTimestamp) >= -ttl;
+        return isOlderThanTtl(timestampDriver, partitionCeiling, maxTimestamp, ttl);
     }
 
     public static short checksumForMetaFormatMinorVersionField(long metadataVersion, int columnCount) {
@@ -760,6 +789,40 @@ public final class TableUtils {
         return dFile(path, columnName, COLUMN_NAME_TXN_NONE);
     }
 
+    /**
+     * Derives the dense descriptor indexes of columns carrying the bloom-filter flag
+     * (bit 25, set by {@link #packParquetConfig}) in their per-column parquet encoding
+     * config, appending them to {@code indexes}.
+     * <p>
+     * The index space is the parquet encoder's dense column list: deleted columns are
+     * skipped, so the produced indexes line up with the columns added to the
+     * {@link io.questdb.griffin.engine.table.parquet.PartitionDescriptor PartitionDescriptor}
+     * by both {@link #produceParquetFromNative} (CONVERT) and
+     * {@code O3PartitionJob.writeFreshParquetFromO3} (fresh O3 partitions). The Rust encoder
+     * reads bloom columns solely from this explicit list, never from the per-column config,
+     * so every encoder path that wants config-driven bloom filters must build the list here.
+     * <p>
+     * Like {@link #parseBloomFilterColumnIndexes}, this method only appends; the caller clears
+     * {@code indexes} first when a fresh result is required.
+     *
+     * @param metadata table metadata whose per-column parquet encoding config flags are inspected
+     * @param indexes  reusable DirectIntList that receives the flagged columns' dense indexes
+     */
+    public static void deriveBloomFilterColumnIndexes(RecordMetadata metadata, DirectIntList indexes) {
+        final int columnCount = metadata.getColumnCount();
+        int descriptorIndex = 0;
+        for (int i = 0; i < columnCount; i++) {
+            final int columnType = metadata.getColumnType(i);
+            if (columnType <= 0) {
+                continue; // skip deleted columns
+            }
+            if (isParquetConfigBloomFilter(metadata.getColumnMetadata(i).getParquetEncodingConfig())) {
+                indexes.add(descriptorIndex);
+            }
+            descriptorIndex++;
+        }
+    }
+
     public static long estimateAvgRecordSize(RecordMetadata metadata) {
         long recSize = 0;
         for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
@@ -837,7 +900,7 @@ public final class TableUtils {
 
     public static int getInt(MemoryR metaMem, long memSize, long offset) {
         if (memSize < offset + Integer.BYTES) {
-            throw CairoException.critical(0).put("File is too small, size=").put(memSize).put(", required=").put(offset + Integer.BYTES);
+            throw CairoException.fileTooSmall(memSize, offset + Integer.BYTES);
         }
         return metaMem.getInt(offset);
     }
@@ -1916,17 +1979,7 @@ public final class TableUtils {
                 bloomFilterIndexes.clear();
                 if (useMetadataBloomFilters) {
                     // Derive bloom filter columns from per-column metadata flags
-                    int metaDescriptorIndex = 0;
-                    for (int i = 0; i < columnCount; i++) {
-                        final int colType = metadata.getColumnType(i);
-                        if (colType <= 0) {
-                            continue;
-                        }
-                        if (TableUtils.isParquetConfigBloomFilter(metadata.getColumnMetadata(i).getParquetEncodingConfig())) {
-                            bloomFilterIndexes.add(metaDescriptorIndex);
-                        }
-                        metaDescriptorIndex++;
-                    }
+                    deriveBloomFilterColumnIndexes(metadata, bloomFilterIndexes);
                 } else {
                     // Explicit bloom_filter_columns override from CONVERT PARTITION WITH clause
                     parseBloomFilterColumnIndexes(metadata, bloomFilterColumns, bloomFilterIndexes);
@@ -2473,11 +2526,7 @@ public final class TableUtils {
     public static void validateMetaVersion(Utf8Sequence metaPath, MemoryMR metaMem, long metaVersionOffset, int expectedVersion) {
         final int metaVersion = metaMem.getInt(metaVersionOffset);
         if (expectedVersion != metaVersion) {
-            throw validationException()
-                    .put("metadata version does not match runtime version [path=").put(metaPath)
-                    .put(", expectedVersion=").put(expectedVersion)
-                    .put(", actualVersion=").put(metaVersion)
-                    .put(']');
+            throw CairoException.metadataVersionMismatch(metaPath, expectedVersion, metaVersion);
         }
     }
 
@@ -2548,6 +2597,7 @@ public final class TableUtils {
         mem.putBool(tableStruct.isWalEnabled());
         mem.putInt(TableUtils.calculateMetaFormatMinorVersionField(0, count));
         mem.putInt(tableStruct.getTtlHoursOrMonths());
+        mem.putInt(tableStruct.getTableFormat());
 
         mem.jumpTo(TableUtils.META_OFFSET_COLUMN_TYPES);
         assert count > 0;
@@ -2610,12 +2660,12 @@ public final class TableUtils {
         }
         final long storageLength = Vm.getStorageLength(strLength);
         if (offset + storageLength > memSize) {
-            throw CairoException.critical(0).put("File is too small, size=").put(memSize).put(", required=").put(offset + storageLength);
+            throw CairoException.fileTooSmall(memSize, offset + storageLength);
         }
         return metaMem.getStrA(offset);
     }
 
-    private static boolean isMetaFormatAtLeast(MemoryR metaMem, short minorVersion) {
+    static boolean isMetaFormatAtLeast(MemoryR metaMem, short minorVersion) {
         int metaFormatMinorVersionField = metaMem.getInt(META_OFFSET_META_FORMAT_MINOR_VERSION);
         short savedChecksum = Numbers.decodeLowShort(metaFormatMinorVersionField);
         short actualChecksum = checksumForMetaFormatMinorVersionField(
@@ -2624,6 +2674,13 @@ public final class TableUtils {
         );
         short savedMetaFormatMinorVersion = Numbers.decodeHighShort(metaFormatMinorVersionField);
         return savedChecksum == actualChecksum && savedMetaFormatMinorVersion >= minorVersion;
+    }
+
+    private static boolean isOlderThanTtl(TimestampDriver timestampDriver, long partitionBoundary, long maxTimestamp, int ttl) {
+        // TTL < 0 means it's in months
+        return ttl > 0
+                ? maxTimestamp - partitionBoundary >= timestampDriver.fromHours(ttl)
+                : timestampDriver.monthsBetween(partitionBoundary, maxTimestamp) >= -ttl;
     }
 
     // Utility method for debugging. This method is not used in production.
@@ -2755,8 +2812,16 @@ public final class TableUtils {
         return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8);
     }
 
+    static int getTableFormat(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_TABLE_FORMAT)
+                ? metaMem.getInt(TableUtils.META_OFFSET_TABLE_FORMAT)
+                : TABLE_FORMAT_NATIVE;
+    }
+
     static int getTtlHoursOrMonths(MemoryR metaMem) {
-        return isMetaFormatUpToDate(metaMem) ? metaMem.getInt(TableUtils.META_OFFSET_TTL_HOURS_OR_MONTHS) : 0;
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_TTL)
+                ? metaMem.getInt(TableUtils.META_OFFSET_TTL_HOURS_OR_MONTHS)
+                : 0;
     }
 
     static boolean isColumnCovering(MemoryR metaMem, int columnIndex) {

@@ -28,7 +28,6 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
-import io.questdb.test.AbstractBootstrapTest;
 import io.questdb.test.TestServerMain;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
@@ -47,7 +46,9 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * End-to-end coverage of the {@link QwpQueryClient#execute} failover loop
- * (failover.md §4.3). Drives the loop against a real {@link TestServerMain}
+ * (see the QWP client-failover reference at
+ * {@code https://questdb.com/docs/high-availability/client-failover/concepts/}).
+ * Drives the loop against a real {@link TestServerMain}
  * so the post-reconnect query path is exercised faithfully (the unit-only
  * tests in the client repo can't follow that branch without a real QWP
  * egress server).
@@ -71,7 +72,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *       the same client is still usable across multiple Execute() calls.</li>
  * </ul>
  */
-public class QwpQueryClientFailoverLoopTest extends AbstractBootstrapTest {
+public class QwpQueryClientFailoverLoopTest extends AbstractQwpBootstrapTest {
 
     /**
      * Hard wall-clock cap per test so a regression that breaks the
@@ -105,7 +106,7 @@ public class QwpQueryClientFailoverLoopTest extends AbstractBootstrapTest {
         // "budget exhausted" (deadline trip mid-loop) or "failover
         // exhausted" (walkTracker drained without binding).
         TestUtils.assertMemoryLeak(() -> {
-            TestServerMain serverMain = startWithEnvVariables();
+            TestServerMain serverMain = startFragmented();
             boolean serverMainClosed = false;
             try (ServerSocket blackhole = new ServerSocket(0)) {
                 int blackholePort = blackhole.getLocalPort();
@@ -166,7 +167,7 @@ public class QwpQueryClientFailoverLoopTest extends AbstractBootstrapTest {
         // through onError on the first execute call. The loop never
         // enters the retry path, so the elapsed time is microseconds.
         TestUtils.assertMemoryLeak(() -> {
-            try (TestServerMain ignored = startWithEnvVariables()) {
+            try (TestServerMain ignored = startFragmented()) {
                 try (QwpQueryClient client = QwpQueryClient.fromConfig(
                         "ws::addr=127.0.0.1:" + HTTP_PORT + ";failover=off;")) {
                     client.connect();
@@ -193,7 +194,7 @@ public class QwpQueryClientFailoverLoopTest extends AbstractBootstrapTest {
         // the root cause, not a downstream symptom from the I/O thread
         // winding down.
         TestUtils.assertMemoryLeak(() -> {
-            try (TestServerMain ignored = startWithEnvVariables()) {
+            try (TestServerMain ignored = startFragmented()) {
                 try (QwpQueryClient client = QwpQueryClient.fromConfig(
                         "ws::addr=127.0.0.1:" + HTTP_PORT + ";failover=off;")) {
                     client.connect();
@@ -221,7 +222,7 @@ public class QwpQueryClientFailoverLoopTest extends AbstractBootstrapTest {
         // succeed against the real server. This proves the loop leaves
         // the client in a consistent state after recovery.
         TestUtils.assertMemoryLeak(() -> {
-            try (TestServerMain serverMain = startWithEnvVariables()) {
+            try (TestServerMain serverMain = startFragmented()) {
                 serverMain.execute("CREATE TABLE recover_test(id LONG, ts TIMESTAMP) "
                         + "TIMESTAMP(ts) PARTITION BY DAY WAL");
                 serverMain.execute("INSERT INTO recover_test SELECT x, x::TIMESTAMP FROM long_sequence(3)");
@@ -272,7 +273,7 @@ public class QwpQueryClientFailoverLoopTest extends AbstractBootstrapTest {
 
     @Test(timeout = TEST_TIMEOUT_MS)
     public void testAuthFailureDuringReconnectSurfacesTerminalNoLoop() throws Exception {
-        // failover.md §6 AuthError: a 401 / 403 on a reconnect attempt
+        // AuthError (QWP client-failover spec): a 401 / 403 on a reconnect attempt
         // is terminal -- the loop must NOT keep walking through it
         // (auth credentials are cluster-wide, retrying every host
         // floods server logs without recovery).
@@ -287,7 +288,7 @@ public class QwpQueryClientFailoverLoopTest extends AbstractBootstrapTest {
         // walkTracker rethrows, execute() catches and surfaces a clean
         // "auth failure during failover reconnect" message.
         TestUtils.assertMemoryLeak(() -> {
-            TestServerMain serverMain = startWithEnvVariables();
+            TestServerMain serverMain = startFragmented();
             boolean serverMainClosed = false;
             try (Fake401Server auth = new Fake401Server()) {
                 auth.start();
@@ -453,4 +454,5 @@ public class QwpQueryClientFailoverLoopTest extends AbstractBootstrapTest {
             lastServerInfo.set(info);
         }
     }
+
 }
